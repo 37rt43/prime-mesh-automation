@@ -19,6 +19,11 @@ import argparse
 import ansys.meshing.prime as prime
 
 
+def launch_prime():
+    """Central secure Prime launcher shared by CLI workflows."""
+    return prime.launch_prime()
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--cad", help="要导入的 CAD 文件路径（STEP/SCDOC/PMDB 等）")
@@ -32,7 +37,7 @@ def main():
     args = parse_args()
 
     # launch_prime() 默认走安全连接，本机自动启动 Prime Server
-    with prime.launch_prime() as prime_client:
+    with launch_prime() as prime_client:
         model = prime_client.model
         print("PyPrimeMesh 客户端版本：", prime.__version__)
         print("Prime Server 已连接。")
