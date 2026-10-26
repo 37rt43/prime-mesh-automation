@@ -4,7 +4,7 @@
 直接使用模型已有的规范命名选择；缺失名称只警告，绝不自动识别边界。
 """
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 import sys
@@ -13,11 +13,13 @@ import ansys.meshing.prime as prime
 from main import launch_prime
 
 
-SCRIPT_REVISION = "exact-names-label-presence-v3"
+SCRIPT_REVISION = "geometry-repair-retry-v4"
 TARGET = 400_000
 LOWER, UPPER = 300_000, 500_000
 LAYERS, GROWTH = 5, 1.2
 MAX_ATTEMPTS = 6
+MAX_GEOMETRY_RETRIES = 4
+FEATURE_TOLERANCE_RATIO = 0.15
 NAMED_SELECTIONS = (
     "inlet-section", "outlet-section", "interface-1", "interface-2", "interface-3",
     "inlet", "outlet", "impeller", "blade", "volute", "front-cover", "back-cover",
@@ -60,9 +62,29 @@ def estimate_sizing(extents, features, scale=1.0):
     return Sizing(base, minimum, blade, port, first)
 
 
+class GeometryMeshError(RuntimeError):
+    """Recoverable surface intersection; retry from a fresh CAD import."""
+
+
+def is_geometry_failure(error):
+    text = str(error).casefold().replace("_", " ").replace("-", " ")
+    return isinstance(error, GeometryMeshError) or any(x in text for x in (
+        "edge intersects face", "edge intersecting face", "edgeintersectingfacefound",
+        "self intersection", "self-intersection"))
+
+
+def retry_sizing(sizing, minimum_floor):
+    minimum = max(sizing.minimum, minimum_floor)
+    return replace(sizing, minimum=minimum, base=max(sizing.base, minimum*2),
+                   blade=max(sizing.blade, minimum), port=max(sizing.port, minimum))
+
+
 def checked(result, operation):
     """Lucid helpers sometimes discard server failures; check low-level results."""
     if hasattr(result, "error_code") and result.error_code != prime.ErrorCode.NOERROR:
+        code = result.error_code
+        if code in (prime.ErrorCode.EDGEINTERSECTINGFACEFOUND, prime.ErrorCode.AUTOMESHFAILED):
+            raise GeometryMeshError(f"{operation}: {result}")
         raise RuntimeError(f"{operation}: {result}")
     warnings = getattr(result, "warning_codes", None)
     if warnings is not None and len(warnings):
@@ -180,6 +202,93 @@ def prepare_named_zones(model, groups):
                     checked(part.add_labels_on_zonelets(["mesh_prism_wall"], zonelets), "壁面层标签")
 
 
+def repair_cohorts(part, groups):
+    """Disjoint groups of equal named membership; never join across interfaces."""
+    protected = set()
+    for name in (*INTERFACES, "inlet", "outlet", "Seal_Chamber_Inlet", "Seal_Chamber_Outlet"):
+        protected.update(groups[name][part.id]['faces'])
+    cohorts = {}
+    for face in part.get_topo_faces():
+        if face in protected:
+            continue
+        membership = tuple(n for n in NAMED_SELECTIONS if face in groups[n][part.id]['faces'])
+        cohorts.setdefault(membership, []).append(int(face))
+    return cohorts
+
+
+def topology_snapshot(part):
+    return set(map(int, part.get_topo_faces())), set(map(int, part.get_topo_edges()))
+
+
+def repair_geometry(model, sizing, groups):
+    tolerance = sizing.minimum * FEATURE_TOLERANCE_RATIO
+    print(f"最小特征容差={tolerance:g}，最小网格尺寸={sizing.minimum:g}（CAD 单位）")
+    for part in model.parts:
+        cohorts = repair_cohorts(part, groups)
+        tool = prime.AutoQuadMesher(model)
+        for membership, original_faces in cohorts.items():
+            faces = sorted(set(original_faces) & set(part.get_topo_faces()))
+            if not faces:
+                continue
+            for operation in ('repair', 'defeature'):
+                before_faces, before_edges = topology_snapshot(part)
+                faces = sorted(set(faces) & before_faces)
+                if not faces:
+                    break
+                print(f"几何处理 {part.name}/{membership or ('未命名',)}: {operation}; 输入面={faces}")
+                if operation == 'repair':
+                    result = tool.repair_topology(part.id, faces, prime.RepairTopologyParams(model,
+                        connect_faces=True, repair_edges=True,
+                        suppress_shared_edges_when_merging=True,
+                        connect_faces_params=prime.ConnectFacesParams(model,
+                            constant_mesh_size=sizing.minimum, absolute_tolerance=tolerance),
+                        repair_edges_params=prime.RepairEdgesParams(model,
+                            constant_mesh_size=sizing.minimum, absolute_tolerance=tolerance)))
+                else:
+                    result = tool.defeature_topology(part.id, faces, prime.DefeatureTopologyParams(model,
+                        partial_defeature=True, aggressive_edge_merge=True,
+                        allow_curved_topo_faces=False, thin_stripes_tolerance=tolerance))
+                print(f"后端处理结果: {result}")
+                checked(result, f"{part.name} {operation}")
+                after_faces, after_edges = topology_snapshot(part)
+                print(f"实际拓扑变化: 移除/替换面ID={sorted(before_faces-after_faces)}, "
+                      f"新增面ID={sorted(after_faces-before_faces)}, "
+                      f"清理/替换边ID={sorted(before_edges-after_edges)}, "
+                      f"新增边ID={sorted(after_edges-before_edges)}")
+    # Operations may replace topology IDs: never keep pre-repair face scopes.
+    return load_named_zones(model)
+
+
+def clean_surface_connections(model, part, groups, sizing):
+    """Stitch only within the same part and named membership; interfaces excluded."""
+    tolerance = sizing.minimum * FEATURE_TOLERANCE_RATIO
+    topo = list(part.get_topo_faces())
+    if topo:
+        cohorts = list(repair_cohorts(part, groups).values())
+        cohorts = [list(model.topo_data.get_mesh_zonelets_of_topo_faces(fs)) for fs in cohorts]
+    else:
+        protected = {z for name in (*INTERFACES, "inlet", "outlet", "Seal_Chamber_Inlet", "Seal_Chamber_Outlet")
+                     for z in groups[name][part.id]['zonelets']}
+        buckets = {}
+        for z in part.get_face_zonelets():
+            if z not in protected:
+                membership = tuple(n for n in NAMED_SELECTIONS if z in groups[n][part.id]['zonelets'])
+                buckets.setdefault(membership, []).append(int(z))
+        cohorts = list(buckets.values())
+    for zonelets in cohorts:
+        if not zonelets:
+            continue
+        result = prime.Connect(model).stitch_face_zonelets(part.id, zonelets, zonelets,
+            prime.StitchParams(model, tolerance=tolerance, use_absolute_tolerance=True,
+                               type=prime.StitchType.FREEFREE, remesh=True))
+        print(f"实际缝合请求 {part.name}: zonelets={zonelets}, 容差={tolerance:g}; 后端结果={result}")
+        checked(result, "面片缝合")
+        result = prime.SurfaceUtilities(model).resolve_intersections(zonelets,
+            prime.ResolveIntersectionsParams(model))
+        print(f"面片相交清理 {part.name}: zonelets={zonelets}; 后端结果={result}")
+        checked(result, "清理面片相交")
+
+
 def generate(model, sizing, groups):
     model.set_global_sizing_params(prime.GlobalSizingParams(
         model, min=sizing.minimum, max=sizing.base, growth_rate=GROWTH))
@@ -207,22 +316,17 @@ def generate(model, sizing, groups):
         c.set_soft_sizing_params(prime.SoftSizingParams(model,
             max=sizing.blade if name in REFINED_REGIONS else sizing.port, growth_rate=GROWTH))
         controls.append(c.id)
+    # Lucid combines curvature/proximity/local controls for defect-tolerant remeshing.
+    prime.lucid.Mesh(model).surface_mesh_with_size_controls()
+    # Lucid discards Surfer return codes; explicit summaries below detect failures.
     sf = checked(prime.SizeField(model).compute_volumetric(controls,
-        prime.VolumetricSizeFieldComputeParams(model)), "尺寸场")
+        prime.VolumetricSizeFieldComputeParams(model)), "体尺寸场")
     for part in model.parts:
         topo_faces = list(part.get_topo_faces())
-        surfer_params = prime.SurferParams(model, size_field_type=prime.SizeFieldType.VOLUMETRIC,
-            min_size=sizing.minimum, max_size=sizing.base, growth_rate=GROWTH)
-        if topo_faces:
-            checked(prime.Surfer(model).mesh_topo_faces(part.id, topo_faces, surfer_params),
-                    f"{part.name} 面网格")
-        else:
-            checked(prime.Surfer(model).remesh_face_zonelets(part.id,
-                part.get_face_zonelets(), part.get_edge_zonelets(), surfer_params),
-                f"{part.name} 面网格")
+        clean_surface_connections(model, part, groups, sizing)
         summary = part.get_summary(prime.PartSummaryParams(model))
         if summary.n_unmeshed_topo_faces or not summary.n_faces:
-            raise RuntimeError(f"{part.name}: 存在未划分的面")
+            raise GeometryMeshError(f"{part.name}: Lucid 面网格未完成，重新导入并增大最小尺寸")
         # Reconstruct volumes only when import has none; do not merge any interfaces.
         if not len(part.get_topo_volumes()) and not len(part.get_volumes()):
             params = prime.ComputeVolumesParams(model)
@@ -286,47 +390,64 @@ def main():
     if args.out.suffix.lower() != ".msh":
         raise ValueError("输出必须使用 .msh 扩展名")
     scale = 1.0
+    minimum_floor = 0.0
+    geometry_retries = count_attempt = 0
     last_count = None
-    for attempt in range(1, MAX_ATTEMPTS+1):
-        # Fresh Prime model each iteration avoids stale zones, mesh and controls.
-        # launch_prime() is centralized in main.py, using its secure default.
-        with launch_prime() as client:
-            model = client.model
-            checked(prime.FileIO(model).import_cad(str(args.cad.resolve()),
-                prime.ImportCadParams(model, geometry_transfer=True)), "读取 CAD")
-            if not model.parts:
-                raise RuntimeError("CAD 未导入任何部件")
-            groups = load_named_zones(model)
-            zonelets = [int(z) for p in model.parts for z in geometry_zonelets(model, p)]
-            low, high, extents = bounds(model, zonelets)
-            print(f"包围盒 min={low}, max={high}; 整体尺寸={extents}（CAD 导入单位）")
-            features = []
-            for name in (*REFINED_REGIONS, "inlet", "outlet"):
-                ids = []
-                for part in model.parts:
-                    item = groups[name][part.id]
-                    ids.extend(geometry_zonelets(model, part, item['faces'])
-                               if item['faces'] else item['zonelets'])
-                if ids:
-                    _, _, dims = bounds(model, ids)
-                    features.extend(d for d in dims if d > max(extents)*1e-8)
-            sizing = estimate_sizing(extents, features, scale)
-            print(f"第 {attempt}/{MAX_ATTEMPTS} 次: {sizing}; 层数={LAYERS}")
-            prepare_named_zones(model, groups)
-            last_count = generate(model, sizing, groups)
-            print(f"实际体网格总数（含边界层）: {last_count}")
-            if LOWER <= last_count <= UPPER:
-                args.out.parent.mkdir(parents=True, exist_ok=True)
-                checked(prime.FileIO(model).export_fluent_meshing_mesh(str(args.out.resolve()),
-                    prime.ExportFluentMeshingMeshParams(model)), "导出 Fluent MSH")
-                if not args.out.is_file() or args.out.stat().st_size == 0:
-                    raise RuntimeError("导出未产生有效文件")
-                print(f"已导出: {args.out.resolve()}")
-                print(f"实际生成的体网格总数: {last_count}")
-                return
-            # N ~ h^-3; damping reduces overshoot with surface/prism contributions.
-            scale *= max(0.65, min(1.6, (last_count / TARGET) ** (0.8/3)))
-    raise RuntimeError(f"{MAX_ATTEMPTS} 次后仍未达到 30–50 万: {last_count}；未导出")
+    while count_attempt < MAX_ATTEMPTS:
+        try:
+            with launch_prime() as client:
+                model = client.model
+                checked(prime.FileIO(model).import_cad(str(args.cad.resolve()),
+                    prime.ImportCadParams(model, geometry_transfer=True)), "读取 CAD")
+                if not model.parts:
+                    raise RuntimeError("CAD 未导入任何部件")
+                groups = load_named_zones(model)
+                zonelets = [int(z) for p in model.parts for z in geometry_zonelets(model, p)]
+                low, high, extents = bounds(model, zonelets)
+                print(f"包围盒 min={low}, max={high}; 整体尺寸={extents}（CAD 导入单位）")
+                features = []
+                for name in (*REFINED_REGIONS, "inlet", "outlet"):
+                    ids = []
+                    for part in model.parts:
+                        item = groups[name][part.id]
+                        ids.extend(geometry_zonelets(model, part, item['faces'])
+                                   if item['faces'] else item['zonelets'])
+                    if ids:
+                        _, _, dims = bounds(model, ids)
+                        features.extend(d for d in dims if d > max(extents)*1e-8)
+                sizing = retry_sizing(estimate_sizing(extents, features, scale), minimum_floor)
+                minimum_floor = sizing.minimum
+                groups = repair_geometry(model, sizing, groups)
+                print(f"体量迭代 {count_attempt + 1}/{MAX_ATTEMPTS}，几何重试 {geometry_retries}/{MAX_GEOMETRY_RETRIES}: {sizing}; 层数={LAYERS}")
+                prepare_named_zones(model, groups)
+                last_count = generate(model, sizing, groups)
+                count_attempt += 1
+                print(f"实际体网格总数（含边界层）: {last_count}")
+                if LOWER <= last_count <= UPPER:
+                    args.out.parent.mkdir(parents=True, exist_ok=True)
+                    checked(prime.FileIO(model).export_fluent_meshing_mesh(str(args.out.resolve()),
+                        prime.ExportFluentMeshingMeshParams(model)), "导出 Fluent MSH")
+                    if not args.out.is_file() or args.out.stat().st_size == 0:
+                        raise RuntimeError("导出未产生有效文件")
+                    print(f"已导出: {args.out.resolve()}")
+                    print(f"实际生成的体网格总数: {last_count}")
+                    return
+        except Exception as error:
+            if not is_geometry_failure(error):
+                raise
+            print(f"几何网格失败: {error}")
+            if geometry_retries >= MAX_GEOMETRY_RETRIES:
+                print(f"几何重试已耗尽（{MAX_GEOMETRY_RETRIES} 次）；未导出。实际体网格总数: {last_count}")
+                raise SystemExit(2)
+            geometry_retries += 1
+            minimum_floor *= 2.0
+            print(f"重新导入原始 CAD，最小尺寸提高至至少 {minimum_floor:g}；"
+                  "按更大特征容差清理极小面/细长面及额外边后重试")
+            continue
+        # Cell count tuning is independent of the monotone geometry-size floor.
+        scale *= max(0.65, min(1.6, (last_count / TARGET) ** (0.8/3)))
+    print(f"{MAX_ATTEMPTS} 次体量迭代后仍未达到 30–50 万: {last_count}；未导出")
+    raise SystemExit(2)
 
 
 if __name__ == "__main__":

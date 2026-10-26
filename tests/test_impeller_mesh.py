@@ -124,5 +124,69 @@ class ImpellerTests(unittest.TestCase):
             ['mesh_refine_Seal_Chamber'], [1,2,3,4,5])
 
 
+class GeometryRepairTests(unittest.TestCase):
+    def test_geometry_error_detection_and_other_failures(self):
+        self.assertTrue(mesh.is_geometry_failure(RuntimeError('Edge intersects face at (-29.2,93.5,14.5)')))
+        self.assertTrue(mesh.is_geometry_failure(mesh.GeometryMeshError('104')))
+        self.assertFalse(mesh.is_geometry_failure(RuntimeError('license unavailable')))
+
+    def test_retry_increases_minimum_and_clamps_local_sizes(self):
+        sizing = mesh.estimate_sizing((100, 80, 30), [10])
+        changed = mesh.retry_sizing(sizing, sizing.minimum * 8)
+        self.assertEqual(changed.minimum, sizing.minimum * 8)
+        self.assertGreaterEqual(changed.base, changed.minimum)
+        self.assertGreaterEqual(changed.blade, changed.minimum)
+        self.assertGreaterEqual(changed.port, changed.minimum)
+
+    def test_repair_cohorts_exclude_interfaces_ports_and_named_boundaries(self):
+        part = SimpleNamespace(id=1, get_topo_faces=lambda: [1,2,3,4,5,6])
+        groups = {n: {1: {'faces': []}} for n in mesh.NAMED_SELECTIONS}
+        groups['interface-1'][1]['faces'] = [1]
+        groups['inlet'][1]['faces'] = [2]
+        groups['blade'][1]['faces'] = [3,4]
+        groups['volute'][1]['faces'] = [5]
+        cohorts = mesh.repair_cohorts(part, groups)
+        self.assertEqual(cohorts[('blade',)], [3,4])
+        self.assertEqual(cohorts[('volute',)], [5])
+        self.assertEqual(cohorts[()], [6])
+
+    def test_intersection_retries_from_new_import_and_then_exports(self):
+        import tempfile
+        from contextlib import nullcontext
+        from pathlib import Path
+        from contextlib import ExitStack
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            cad, out = Path(directory)/'fixture.scdoc', Path(directory)/'fixture.msh'
+            cad.write_text('test fixture')
+            part = SimpleNamespace(id=1)
+            model = SimpleNamespace(parts=[part])
+            groups = {n: {1: {'faces': [], 'zonelets': []}} for n in mesh.NAMED_SELECTIONS}
+            fileio = Mock()
+            fileio.import_cad.return_value = None
+            def fake_export(path, params):
+                Path(path).write_text('mock exporter fixture, not a mesh')
+            fileio.export_fluent_meshing_mesh.side_effect = fake_export
+            stack.enter_context(patch.object(mesh, 'parse_args', return_value=SimpleNamespace(cad=cad,out=out)))
+            launch = stack.enter_context(patch.object(mesh, 'launch_prime',
+                side_effect=lambda: nullcontext(SimpleNamespace(model=model))))
+            for name in ('ImportCadParams', 'ExportFluentMeshingMeshParams'):
+                stack.enter_context(patch.object(mesh.prime, name, return_value=None))
+            stack.enter_context(patch.object(mesh.prime, 'FileIO', return_value=fileio))
+            stack.enter_context(patch.object(mesh, 'load_named_zones', return_value=groups))
+            stack.enter_context(patch.object(mesh, 'geometry_zonelets', return_value=[1]))
+            stack.enter_context(patch.object(mesh, 'bounds', return_value=((0,0,0),(100,80,30),(100,80,30))))
+            stack.enter_context(patch.object(mesh, 'repair_geometry', return_value=groups))
+            stack.enter_context(patch.object(mesh, 'prepare_named_zones'))
+            generate = stack.enter_context(patch.object(mesh, 'generate', side_effect=[
+                mesh.GeometryMeshError('Edge intersects face at (-29.2,93.5,14.5)'), 400000]))
+            with redirect_stdout(StringIO()):
+                mesh.main()
+            self.assertEqual(launch.call_count, 2)
+            self.assertEqual(fileio.import_cad.call_count, 2)
+            first, second = [c.args[1] for c in generate.call_args_list]
+            self.assertEqual(second.minimum, first.minimum*2)
+            fileio.export_fluent_meshing_mesh.assert_called_once()
+
+
 if __name__ == '__main__':
     unittest.main()
