@@ -62,6 +62,38 @@ class ImpellerTests(unittest.TestCase):
         self.assertEqual(queried, ['inlet'])
 
     @patch.object(mesh.prime, 'NamePatternParams', return_value=None)
+    def test_volute_label_without_faces_is_recognized_and_continues(self, *_):
+        model, part = self.boundary_model({'volute': []})
+        output = StringIO()
+        with redirect_stdout(output):
+            groups = mesh.load_named_zones(model)
+            mesh.prepare_named_zones(model, groups)
+        self.assertTrue(groups['volute'][1]['recognized'])
+        self.assertEqual(groups['volute'][1]['faces'], [])
+        self.assertNotIn("未找到命名选择/zone 'volute'", output.getvalue())
+        self.assertIn("已识别 'volute'", output.getvalue())
+        self.assertIn("未找到命名选择/zone 'blade'", output.getvalue())
+        model.create_zone.assert_not_called()
+        part.get_topo_volumes.assert_not_called()
+
+    @patch.object(mesh.prime, 'NamePatternParams', return_value=None)
+    def test_volute_body_group_without_faces_is_recognized(self, *_):
+        model, part = self.boundary_model({'interface-3': [], 'volute': []})
+        part.name = 'volute'
+        part.get_topo_faces.return_value = []
+        part.get_face_zonelets.return_value = []
+        part.get_face_zonelets_of_label_name_pattern.return_value = []
+        output = StringIO()
+        with redirect_stdout(output):
+            groups = mesh.load_named_zones(model)
+            mesh.prepare_named_zones(model, groups)
+        self.assertTrue(groups['volute'][1]['recognized'])
+        self.assertTrue(groups['volute'][1]['region'])
+        self.assertTrue(groups['interface-3'][1]['recognized'])
+        self.assertNotIn("未找到命名选择/zone 'volute'", output.getvalue())
+        self.assertNotIn("未找到命名选择/zone 'interface-3'", output.getvalue())
+
+    @patch.object(mesh.prime, 'NamePatternParams', return_value=None)
     def test_interfaces_stay_separate_and_out_of_prism_walls(self, *_):
         model, part = self.boundary_model({
             'impeller': [1, 2, 3, 4, 5], 'blade': [5], 'inlet': [4]},

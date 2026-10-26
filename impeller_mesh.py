@@ -13,6 +13,7 @@ import ansys.meshing.prime as prime
 from main import launch_prime
 
 
+SCRIPT_REVISION = "exact-names-label-presence-v3"
 TARGET = 400_000
 LOWER, UPPER = 300_000, 500_000
 LAYERS, GROWTH = 5, 1.2
@@ -101,8 +102,13 @@ def load_named_zones(model):
             labels = list(part.get_labels())
             face_zone_ids = [z for z in part.get_face_zones() if model.get_zone_name(z) == name]
             volume_zone_ids = [z for z in part.get_volume_zones() if model.get_zone_name(z) == name]
+            # Label existence is independent of whether Prime exposes any faces.
+            # Body/volume labels and pre-mesh selections can legitimately be empty here.
+            label_present = name in labels
+            recognized = bool(label_present or face_zone_ids or volume_zone_ids or part.name == name)
+            found |= recognized
             faces, zonelets = set(), set()
-            if name in labels:
+            if label_present:
                 if topo:
                     faces.update(map(int, part.get_topo_faces_of_label_name_pattern(name, params)))
                 else:
@@ -127,9 +133,10 @@ def load_named_zones(model):
                     faces.update(topo)
                     if not topo:
                         zonelets.update(map(int, part.get_face_zonelets()))
-            found |= bool(faces or zonelets or face_zone_ids or volume_zone_ids or part_region)
             groups[name][part.id] = dict(faces=sorted(faces), zonelets=sorted(zonelets),
-                face_zones=face_zone_ids, region=part_region)
+                face_zones=face_zone_ids, region=part_region, recognized=recognized)
+            if recognized and not (faces or zonelets):
+                print(f"警告: 已识别 '{name}'（部件 {part.name}），但暂无可用面实体；保留名称并继续")
         if not found:
             print(f"警告: 未找到命名选择/zone '{name}'，跳过该名称并继续")
     return groups
@@ -271,6 +278,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    print(f"impeller_mesh 版本: {SCRIPT_REVISION}; 脚本路径: {Path(__file__).resolve()}")
     if not prime.__version__.startswith("0.5.") or not (3, 8) <= sys.version_info[:2] <= (3, 11):
         raise RuntimeError("必须使用 Python 3.8–3.11 与 PyPrimeMesh 0.5.x / Prime 24.1")
     if not args.cad.is_file():
