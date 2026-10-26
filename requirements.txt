@@ -1,0 +1,5 @@
+# PyPrimeMesh（对应 github.com/ansys/pyprimemesh）
+# 客户端与 Ansys Prime Server 一对一兼容：
+#   2024R1 (24.1.0) 必须用 0.5.x 客户端，支持 Python 3.8-3.11
+# 因此本仓库固定 0.5.x，且虚拟环境必须用 Python 3.11（不能用 3.12+）
+ansys-meshing-prime==0.5.*

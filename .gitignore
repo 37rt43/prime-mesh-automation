@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.msh
+*.cas
+*.case
+*.pmdb
+*.scdoc
+*.step
+*.stp
+#（注：内容由AI生成）
