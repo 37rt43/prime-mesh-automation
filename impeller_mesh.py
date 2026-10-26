@@ -13,12 +13,13 @@ import ansys.meshing.prime as prime
 from main import launch_prime
 
 
-SCRIPT_REVISION = "geometry-repair-retry-v4"
+SCRIPT_REVISION = "surface-failure-retry-v5"
 TARGET = 400_000
 LOWER, UPPER = 300_000, 500_000
 LAYERS, GROWTH = 5, 1.2
 MAX_ATTEMPTS = 6
 MAX_GEOMETRY_RETRIES = 4
+GEOMETRY_RETRY_FACTOR = 1.5
 FEATURE_TOLERANCE_RATIO = 0.15
 NAMED_SELECTIONS = (
     "inlet-section", "outlet-section", "interface-1", "interface-2", "interface-3",
@@ -70,12 +71,13 @@ def is_geometry_failure(error):
     text = str(error).casefold().replace("_", " ").replace("-", " ")
     return isinstance(error, GeometryMeshError) or any(x in text for x in (
         "edge intersects face", "edge intersecting face", "edgeintersectingfacefound",
-        "self intersection", "self-intersection"))
+        "self intersection", "surface meshing failed", "surfacemeshingfailed",
+        "surface mesh failed"))
 
 
-def retry_sizing(sizing, minimum_floor):
+def retry_sizing(sizing, minimum_floor, base_floor=0.0):
     minimum = max(sizing.minimum, minimum_floor)
-    return replace(sizing, minimum=minimum, base=max(sizing.base, minimum*2),
+    return replace(sizing, minimum=minimum, base=max(sizing.base, base_floor, minimum*2),
                    blade=max(sizing.blade, minimum), port=max(sizing.port, minimum))
 
 
@@ -289,6 +291,42 @@ def clean_surface_connections(model, part, groups, sizing):
         checked(result, "清理面片相交")
 
 
+def report_surface_failure(model, part, error):
+    faces = list(map(int, part.get_topo_faces()))
+    print(f"面网格失败: part={part.name!r}, part ID={part.id}; 原因={error}")
+    print(f"本次提交的 topo face IDs={faces}")
+    exact = getattr(error, "failed_topo_face_ids", None)
+    if exact is not None and len(exact):
+        print(f"后端报告的失败 topo face IDs={list(exact)}")
+    else:
+        print("后端未返回确切失败 topo face ID；以下未网格化面用于定位，不代表每个面都有缺陷")
+    try:
+        unmeshed = [f for f in faces if not len(model.topo_data.get_mesh_zonelets_of_topo_faces([f]))]
+        print(f"未生成网格的 topo face IDs={unmeshed}")
+        if not faces:
+            print(f"该 part 无 topo face；面 zonelet IDs={list(part.get_face_zonelets())}")
+    except Exception as diagnostic_error:
+        print(f"面 ID 诊断不可用: {diagnostic_error}；保留原始失败原因")
+
+
+def mesh_surfaces(model):
+    # Per-part calls identify the failing scope even when Lucid raises mid-command.
+    mesher = prime.lucid.Mesh(model)
+    for part in model.parts:
+        try:
+            mesher.surface_mesh_with_size_controls(
+                scope=prime.lucid.SurfaceScope(part_expression=part.name))
+            summary = part.get_summary(prime.PartSummaryParams(model))
+            if summary.n_unmeshed_topo_faces or not summary.n_faces:
+                raise GeometryMeshError("Surface meshing failed: Lucid 面网格未完成")
+        except Exception as error:
+            report_surface_failure(model, part, error)
+            if is_geometry_failure(error):
+                raise GeometryMeshError(f"Surface meshing failed: part={part.name!r}, "
+                                        f"part ID={part.id}; {error}") from error
+            raise
+
+
 def generate(model, sizing, groups):
     model.set_global_sizing_params(prime.GlobalSizingParams(
         model, min=sizing.minimum, max=sizing.base, growth_rate=GROWTH))
@@ -317,7 +355,7 @@ def generate(model, sizing, groups):
             max=sizing.blade if name in REFINED_REGIONS else sizing.port, growth_rate=GROWTH))
         controls.append(c.id)
     # Lucid combines curvature/proximity/local controls for defect-tolerant remeshing.
-    prime.lucid.Mesh(model).surface_mesh_with_size_controls()
+    mesh_surfaces(model)
     # Lucid discards Surfer return codes; explicit summaries below detect failures.
     sf = checked(prime.SizeField(model).compute_volumetric(controls,
         prime.VolumetricSizeFieldComputeParams(model)), "体尺寸场")
@@ -326,7 +364,9 @@ def generate(model, sizing, groups):
         clean_surface_connections(model, part, groups, sizing)
         summary = part.get_summary(prime.PartSummaryParams(model))
         if summary.n_unmeshed_topo_faces or not summary.n_faces:
-            raise GeometryMeshError(f"{part.name}: Lucid 面网格未完成，重新导入并增大最小尺寸")
+            error = GeometryMeshError("Surface meshing failed: 连接处理后面网格不完整")
+            report_surface_failure(model, part, error)
+            raise error
         # Reconstruct volumes only when import has none; do not merge any interfaces.
         if not len(part.get_topo_volumes()) and not len(part.get_volumes()):
             params = prime.ComputeVolumesParams(model)
@@ -390,10 +430,11 @@ def main():
     if args.out.suffix.lower() != ".msh":
         raise ValueError("输出必须使用 .msh 扩展名")
     scale = 1.0
-    minimum_floor = 0.0
+    minimum_floor = base_floor = 0.0
     geometry_retries = count_attempt = 0
     last_count = None
     while count_attempt < MAX_ATTEMPTS:
+        sizing = None
         try:
             with launch_prime() as client:
                 model = client.model
@@ -415,7 +456,7 @@ def main():
                     if ids:
                         _, _, dims = bounds(model, ids)
                         features.extend(d for d in dims if d > max(extents)*1e-8)
-                sizing = retry_sizing(estimate_sizing(extents, features, scale), minimum_floor)
+                sizing = retry_sizing(estimate_sizing(extents, features, scale), minimum_floor, base_floor)
                 minimum_floor = sizing.minimum
                 groups = repair_geometry(model, sizing, groups)
                 print(f"体量迭代 {count_attempt + 1}/{MAX_ATTEMPTS}，几何重试 {geometry_retries}/{MAX_GEOMETRY_RETRIES}: {sizing}; 层数={LAYERS}")
@@ -440,8 +481,13 @@ def main():
                 print(f"几何重试已耗尽（{MAX_GEOMETRY_RETRIES} 次）；未导出。实际体网格总数: {last_count}")
                 raise SystemExit(2)
             geometry_retries += 1
-            minimum_floor *= 2.0
-            print(f"重新导入原始 CAD，最小尺寸提高至至少 {minimum_floor:g}；"
+            if sizing is not None:
+                minimum_floor = sizing.minimum * GEOMETRY_RETRY_FACTOR
+                base_floor = sizing.base * GEOMETRY_RETRY_FACTOR
+            else:
+                scale *= GEOMETRY_RETRY_FACTOR
+            print(f"重新导入原始 CAD，最小尺寸与整体尺寸均放大 {GEOMETRY_RETRY_FACTOR:g} 倍；"
+                  f"最小尺寸下限={minimum_floor:g}，整体尺寸下限={base_floor:g}；"
                   "按更大特征容差清理极小面/细长面及额外边后重试")
             continue
         # Cell count tuning is independent of the monotone geometry-size floor.

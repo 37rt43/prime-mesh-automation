@@ -128,6 +128,8 @@ class GeometryRepairTests(unittest.TestCase):
     def test_geometry_error_detection_and_other_failures(self):
         self.assertTrue(mesh.is_geometry_failure(RuntimeError('Edge intersects face at (-29.2,93.5,14.5)')))
         self.assertTrue(mesh.is_geometry_failure(mesh.GeometryMeshError('104')))
+        self.assertTrue(mesh.is_geometry_failure(RuntimeError('Surface meshing failed')))
+        self.assertTrue(mesh.is_geometry_failure(RuntimeError('SURFACE_MESHING_FAILED')))
         self.assertFalse(mesh.is_geometry_failure(RuntimeError('license unavailable')))
 
     def test_retry_increases_minimum_and_clamps_local_sizes(self):
@@ -150,7 +152,7 @@ class GeometryRepairTests(unittest.TestCase):
         self.assertEqual(cohorts[('volute',)], [5])
         self.assertEqual(cohorts[()], [6])
 
-    def test_intersection_retries_from_new_import_and_then_exports(self):
+    def test_surface_failures_retry_four_times_growing_both_sizes_then_export(self):
         import tempfile
         from contextlib import nullcontext
         from pathlib import Path
@@ -178,14 +180,31 @@ class GeometryRepairTests(unittest.TestCase):
             stack.enter_context(patch.object(mesh, 'repair_geometry', return_value=groups))
             stack.enter_context(patch.object(mesh, 'prepare_named_zones'))
             generate = stack.enter_context(patch.object(mesh, 'generate', side_effect=[
-                mesh.GeometryMeshError('Edge intersects face at (-29.2,93.5,14.5)'), 400000]))
+                *[RuntimeError('Surface meshing failed')] * 4, 400000]))
             with redirect_stdout(StringIO()):
                 mesh.main()
-            self.assertEqual(launch.call_count, 2)
-            self.assertEqual(fileio.import_cad.call_count, 2)
-            first, second = [c.args[1] for c in generate.call_args_list]
-            self.assertEqual(second.minimum, first.minimum*2)
+            self.assertEqual(launch.call_count, 5)
+            self.assertEqual(fileio.import_cad.call_count, 5)
+            sizes = [c.args[1] for c in generate.call_args_list]
+            for first, second in zip(sizes, sizes[1:]):
+                self.assertAlmostEqual(second.minimum, first.minimum*1.5)
+                self.assertAlmostEqual(second.base, first.base*1.5)
             fileio.export_fluent_meshing_mesh.assert_called_once()
+
+    @patch.object(mesh.prime, 'PartSummaryParams', return_value=None)
+    @patch.object(mesh.prime.lucid, 'Mesh')
+    def test_surface_exception_reports_part_and_unmeshed_faces(self, mesher, *_):
+        part = SimpleNamespace(id=7, name='volute', get_topo_faces=lambda: [11,12])
+        model = Mock(parts=[part])
+        model.topo_data.get_mesh_zonelets_of_topo_faces.side_effect = lambda fs: [99] if fs == [11] else []
+        mesher.return_value.surface_mesh_with_size_controls.side_effect = RuntimeError('Surface meshing failed')
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(mesh.GeometryMeshError):
+            mesh.mesh_surfaces(model)
+        self.assertIn("part='volute', part ID=7", output.getvalue())
+        self.assertIn("本次提交的 topo face IDs=[11, 12]", output.getvalue())
+        self.assertIn("未生成网格的 topo face IDs=[12]", output.getvalue())
+
 
 
 if __name__ == '__main__':
