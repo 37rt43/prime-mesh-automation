@@ -1,13 +1,10 @@
 """FFF-2 流体域自动 POLY 网格；Python 3.11 + PyPrimeMesh 0.5.x / Prime 24.1.
 
 运行 python impeller_mesh.py --cad FFF-2.scdoc --out FFF-2.msh
-CAD 必须是已封闭的流体域，并包含可识别的进口、出口、叶片、蜗壳面标签。
-无语义标签时用 --zones-json 指定已有标签的 glob 模式；不猜测物理边界。
+直接使用模型已有的规范命名选择；缺失名称只警告，绝不自动识别边界。
 """
 import argparse
 from dataclasses import dataclass
-import fnmatch
-import json
 import math
 from pathlib import Path
 import sys
@@ -20,12 +17,16 @@ TARGET = 400_000
 LOWER, UPPER = 300_000, 500_000
 LAYERS, GROWTH = 5, 1.2
 MAX_ATTEMPTS = 6
-DEFAULT_PATTERNS = {
-    "inlet": ["*inlet*", "*进口*", "*入口*"],
-    "outlet": ["*outlet*", "*出口*"],
-    "blades": ["*blade*", "*叶片*"],
-    "volute": ["*volute*", "*蜗壳*"],
-}
+NAMED_SELECTIONS = (
+    "inlet-section", "outlet-section", "interface-1", "interface-2", "interface-3",
+    "inlet", "outlet", "impeller", "blade", "volute", "front-cover", "back-cover",
+    "Seal_Chamber_Inlet", "Seal_Chamber_Outlet", "Seal_Chamber",
+)
+INTERFACES = ("interface-1", "interface-2", "interface-3")
+REFINED_REGIONS = ("impeller", "blade", "Seal_Chamber_Inlet",
+                   "Seal_Chamber_Outlet", "Seal_Chamber")
+# Only these explicitly named surfaces grow prisms. Ports and interfaces never do.
+WALL_NAMES = ("impeller", "blade", "volute", "front-cover", "back-cover", "Seal_Chamber")
 
 
 @dataclass(frozen=True)
@@ -68,65 +69,111 @@ def checked(result, operation):
     return result
 
 
-def face_entities(model, part):
-    faces = list(part.get_topo_faces())
-    return faces, list(model.topo_data.get_geom_zonelets_of_topo_faces(faces))
-
-
-def bounds(model, faces):
-    zonelets = model.topo_data.get_geom_zonelets_of_topo_faces(faces)
+def bounds(model, zonelets):
     if not len(zonelets):
-        raise RuntimeError("CAD 缺少几何面 zonelets，不能估计包围盒")
+        raise RuntimeError("模型缺少可测量的几何/面 zonelets，不能估计包围盒")
     b = prime.SurfaceUtilities(model).get_bounding_box_of_zonelets(zonelets)
     low, high = (b.xmin, b.ymin, b.zmin), (b.xmax, b.ymax, b.zmax)
     return low, high, tuple(y-x for x, y in zip(low, high))
 
 
-def identify_boundaries(model, patterns):
-    """Return disjoint face sets; preserve all unmatched surfaces as walls."""
-    groups = {name: {} for name in patterns}
-    inventory = {}
-    for part in model.parts:
-        faces, _ = face_entities(model, part)
-        if not faces or not len(part.get_topo_volumes()):
-            raise RuntimeError(f"{part.name}: 需要封闭的 CAD 流体体积及拓扑面")
-        labels = list(part.get_labels())
-        inventory[part.name] = labels
-        claimed = set()
-        for name, globs in patterns.items():
-            selected = set()
-            for label in labels:
-                if any(fnmatch.fnmatchcase(label.casefold(), g.casefold()) for g in globs):
-                    selected.update(map(int, part.get_topo_faces_of_label_name_pattern(
-                        label, prime.NamePatternParams(model))))
-            if selected & claimed:
-                raise RuntimeError(f"{part.name}: {name} 与其他边界重叠，请修正标签")
-            claimed.update(selected)
-            groups[name][part.id] = sorted(selected)
-        groups.setdefault("wall_other", {})[part.id] = sorted(set(faces)-claimed)
-    print("CAD 面标签清单:", json.dumps(inventory, ensure_ascii=False))
-    missing = [n for n in patterns if not any(groups[n].values())]
-    if missing:
-        raise RuntimeError(f"缺少可识别的面标签 {missing}。请在 CAD 中命名或用 --zones-json 映射。")
+def geometry_zonelets(model, part, faces=None):
+    if faces is None:
+        faces = list(part.get_topo_faces())
+        if not faces:
+            return list(part.get_face_zonelets())
+    return list(model.topo_data.get_geom_zonelets_of_topo_faces(faces))
+
+
+def load_named_zones(model):
+    """Exact, case-sensitive names only; no inference or closed-topology check.
+
+    Reuse imported zones. CAD named selections imported as face labels are
+    materialized under their original names. A named part scopes its surfaces
+    for sizing only; no part/volume is renamed or merged.
+    """
+    groups = {name: {} for name in NAMED_SELECTIONS}
+    params = prime.NamePatternParams(model)
+    for name in NAMED_SELECTIONS:
+        found = False
+        for part in model.parts:
+            topo = list(part.get_topo_faces())
+            labels = list(part.get_labels())
+            face_zone_ids = [z for z in part.get_face_zones() if model.get_zone_name(z) == name]
+            volume_zone_ids = [z for z in part.get_volume_zones() if model.get_zone_name(z) == name]
+            faces, zonelets = set(), set()
+            if name in labels:
+                if topo:
+                    faces.update(map(int, part.get_topo_faces_of_label_name_pattern(name, params)))
+                else:
+                    zonelets.update(map(int, part.get_face_zonelets_of_label_name_pattern(name, params)))
+            if face_zone_ids:
+                if topo:
+                    faces.update(map(int, part.get_topo_faces_of_zone_name_pattern(name, params)))
+                else:
+                    zonelets.update(map(int, part.get_face_zonelets_of_zone_name_pattern(name, params)))
+            part_region = part.name == name or bool(volume_zone_ids)
+            if part_region:
+                # A named volume scopes its boundary, rather than becoming a face zone.
+                if volume_zone_ids:
+                    volumes = part.get_volumes_of_zone_name_pattern(name, params)
+                    boundary = list(part.get_face_zonelets_of_volumes(volumes)) if len(volumes) else []
+                    if topo:
+                        faces.update(f for f in topo if set(
+                            model.topo_data.get_mesh_zonelets_of_topo_faces([f])) & set(boundary))
+                    else:
+                        zonelets.update(boundary)
+                if part.name == name or (volume_zone_ids and len(part.get_volume_zones()) == 1):
+                    faces.update(topo)
+                    if not topo:
+                        zonelets.update(map(int, part.get_face_zonelets()))
+            found |= bool(faces or zonelets or face_zone_ids or volume_zone_ids or part_region)
+            groups[name][part.id] = dict(faces=sorted(faces), zonelets=sorted(zonelets),
+                face_zones=face_zone_ids, region=part_region)
+        if not found:
+            print(f"警告: 未找到命名选择/zone '{name}'，跳过该名称并继续")
     return groups
 
 
-def create_boundaries(model, groups):
-    for name, per_part in groups.items():
-        if not any(per_part.values()):
-            continue
-        zone = checked(model.create_zone(name, prime.ZoneType.FACE), f"建立 {name} zone")
+def prepare_named_zones(model, groups):
+    """Keep every interface separately; never merge, stitch, connect or relabel it as wall."""
+    for name in (*[n for n in NAMED_SELECTIONS if n not in INTERFACES], *INTERFACES):
+        per_part = groups[name]
+        zone_id = next((z for item in per_part.values() for z in item['face_zones']), None)
         for part in model.parts:
-            faces = per_part[part.id]
-            if faces:
-                checked(part.add_topo_entities_to_zone(zone.zone_id, faces), f"填充 {name}")
-                # Canonical private labels keep prism/sizing scopes independent of CAD aliases.
-                checked(part.add_labels_on_topo_entities([f"auto_{name}"], faces), f"标签 {name}")
-                if name not in ("inlet", "outlet"):
-                    checked(part.add_labels_on_topo_entities(["auto_wall"], faces), "壁面标签")
+            item = per_part[part.id]
+            if not item['region'] and (item['faces'] or item['zonelets']):
+                if zone_id is None:
+                    zone_id = checked(model.create_zone(name, prime.ZoneType.FACE),
+                                      f"建立 {name} zone").zone_id
+                if item['faces']:
+                    checked(part.add_topo_entities_to_zone(zone_id, item['faces']), f"保留 {name}")
+                else:
+                    checked(part.add_zonelets_to_zone(zone_id, item['zonelets']), f"保留 {name}")
+    # Interfaces and port faces take priority over broad region selections.
+    for part in model.parts:
+        blocked_faces, blocked_zonelets = set(), set()
+        for name in (*INTERFACES, "inlet", "outlet", "Seal_Chamber_Inlet", "Seal_Chamber_Outlet"):
+            item = groups[name][part.id]
+            blocked_faces.update(item['faces'])
+            blocked_zonelets.update(item['zonelets'])
+        for name in NAMED_SELECTIONS:
+            item = groups[name][part.id]
+            if name in (*REFINED_REGIONS, "inlet", "outlet"):
+                if item['faces']:
+                    checked(part.add_labels_on_topo_entities([f"mesh_refine_{name}"], item['faces']), "局部尺寸标签")
+                if item['zonelets']:
+                    checked(part.add_labels_on_zonelets([f"mesh_refine_{name}"], item['zonelets']), "局部尺寸标签")
+            if name in WALL_NAMES:
+                faces = sorted(set(item['faces']) - blocked_faces)
+                zonelets = sorted(set(item['zonelets']) - blocked_zonelets)
+                if faces:
+                    checked(part.add_labels_on_topo_entities(["mesh_prism_wall"], faces), "壁面层标签")
+                if zonelets:
+                    checked(part.add_labels_on_zonelets(["mesh_prism_wall"], zonelets), "壁面层标签")
 
 
-def generate(model, sizing):
+def generate(model, sizing, groups):
     model.set_global_sizing_params(prime.GlobalSizingParams(
         model, min=sizing.minimum, max=sizing.base, growth_rate=GROWTH))
     controls = []
@@ -144,48 +191,74 @@ def generate(model, sizing):
                 model, **common, elements_per_gap=4,
                 ignore_self_proximity=False, ignore_orientation=True))
         controls.append(c.id)
-    for name in ("blades", "inlet", "outlet"):
+    for name in (*REFINED_REGIONS, "inlet", "outlet"):
+        if not any(item["faces"] or item["zonelets"] for item in groups[name].values()):
+            continue
         c = model.control_data.create_size_control(prime.SizingType.SOFT)
-        checked(c.set_scope(prime.ScopeDefinition(model, label_expression=f"auto_{name}")),
+        checked(c.set_scope(prime.ScopeDefinition(model, label_expression=f"mesh_refine_{name}")),
                 f"{name} 尺寸范围")
         c.set_soft_sizing_params(prime.SoftSizingParams(model,
-            max=sizing.blade if name == "blades" else sizing.port, growth_rate=GROWTH))
+            max=sizing.blade if name in REFINED_REGIONS else sizing.port, growth_rate=GROWTH))
         controls.append(c.id)
     sf = checked(prime.SizeField(model).compute_volumetric(controls,
         prime.VolumetricSizeFieldComputeParams(model)), "尺寸场")
     for part in model.parts:
-        checked(prime.Surfer(model).mesh_topo_faces(part.id, part.get_topo_faces(),
-            prime.SurferParams(model, size_field_type=prime.SizeFieldType.VOLUMETRIC,
-                               min_size=sizing.minimum, max_size=sizing.base,
-                               growth_rate=GROWTH)), f"{part.name} 面网格")
+        topo_faces = list(part.get_topo_faces())
+        surfer_params = prime.SurferParams(model, size_field_type=prime.SizeFieldType.VOLUMETRIC,
+            min_size=sizing.minimum, max_size=sizing.base, growth_rate=GROWTH)
+        if topo_faces:
+            checked(prime.Surfer(model).mesh_topo_faces(part.id, topo_faces, surfer_params),
+                    f"{part.name} 面网格")
+        else:
+            checked(prime.Surfer(model).remesh_face_zonelets(part.id,
+                part.get_face_zonelets(), part.get_edge_zonelets(), surfer_params),
+                f"{part.name} 面网格")
         summary = part.get_summary(prime.PartSummaryParams(model))
         if summary.n_unmeshed_topo_faces or not summary.n_faces:
             raise RuntimeError(f"{part.name}: 存在未划分的面")
-        fluid = checked(model.create_zone(f"fluid_{part.id}", prime.ZoneType.VOLUME), "流体 zone")
-        checked(part.add_topo_entities_to_zone(fluid.zone_id, part.get_topo_volumes()), "流体体积")
+        # Reconstruct volumes only when import has none; do not merge any interfaces.
+        if not len(part.get_topo_volumes()) and not len(part.get_volumes()):
+            params = prime.ComputeVolumesParams(model)
+            if topo_faces:
+                checked(part.compute_topo_volumes(params), "计算体积")
+            else:
+                checked(part.compute_closed_volumes(params), "计算体积")
+        # Preserve all imported volume names; only create a fallback when absent.
+        if not len(part.get_volume_zones()):
+            fluid = checked(model.create_zone(part.name if part.name in NAMED_SELECTIONS else f"fluid_{part.id}",
+                                              prime.ZoneType.VOLUME), "流体 zone")
+            if len(part.get_topo_volumes()):
+                checked(part.add_topo_entities_to_zone(fluid.zone_id, part.get_topo_volumes()), "流体体积")
+            else:
+                checked(part.add_volumes_to_zone(fluid.zone_id, part.get_volumes()), "流体体积")
         vc = model.control_data.create_volume_control()
         vc.set_params(prime.VolumeControlParams(model, cell_zonelet_type=prime.CellZoneletType.FLUID))
         checked(vc.set_scope(prime.ScopeDefinition(model,
             entity_type=prime.ScopeEntity.VOLUME, evaluation_type=prime.ScopeEvaluationType.ZONES,
-            part_expression=part.name, zone_expression=f"fluid_{part.id}")), "流体范围")
-        pc = model.control_data.create_prism_control()
-        checked(pc.set_surface_scope(prime.ScopeDefinition(model,
-            part_expression=part.name, label_expression="auto_wall")), "边界层壁面")
-        checked(pc.set_volume_scope(prime.ScopeDefinition(model,
-            entity_type=prime.ScopeEntity.VOLUME, evaluation_type=prime.ScopeEvaluationType.ZONES,
-            part_expression=part.name, zone_expression=f"fluid_{part.id}")), "边界层体积")
-        pc.set_growth_params(prime.PrismControlGrowthParams(model,
-            offset_type=prime.PrismControlOffsetType.UNIFORM, n_layers=LAYERS,
-            growth_rate=GROWTH, first_height=sizing.first_height))
+            part_expression=part.name, zone_expression="*")), "流体范围")
+        prism_ids = []
+        if "mesh_prism_wall" in part.get_labels():
+            pc = model.control_data.create_prism_control()
+            checked(pc.set_surface_scope(prime.ScopeDefinition(model,
+                part_expression=part.name, label_expression="mesh_prism_wall")), "边界层壁面")
+            checked(pc.set_volume_scope(prime.ScopeDefinition(model,
+                entity_type=prime.ScopeEntity.VOLUME, evaluation_type=prime.ScopeEvaluationType.ZONES,
+                part_expression=part.name, zone_expression="*")), "边界层体积")
+            pc.set_growth_params(prime.PrismControlGrowthParams(model,
+                offset_type=prime.PrismControlOffsetType.UNIFORM, n_layers=LAYERS,
+                growth_rate=GROWTH, first_height=sizing.first_height))
+            prism_ids.append(pc.id)
         checked(prime.AutoMesh(model).mesh(part.id, prime.AutoMeshParams(model,
             volume_fill_type=prime.VolumeFillType.POLY, max_size=sizing.base,
             size_field_type=prime.SizeFieldType.VOLUMETRIC,
-            volume_control_ids=[vc.id], prism_control_ids=[pc.id])), f"{part.name} POLY 体网格")
+            volume_control_ids=[vc.id], prism_control_ids=prism_ids)), f"{part.name} POLY 体网格")
     # Keep field active through volume meshing, then release controls.
     model.delete_volumetric_size_fields([sf.size_field_id])
     summaries = [p.get_summary(prime.PartSummaryParams(model)) for p in model.parts]
-    if any(s.n_cells <= 0 or s.n_poly_cells <= 0 or s.n_prism_cells <= 0 for s in summaries):
-        raise RuntimeError("部分流体域缺少体单元、POLY 单元或边界层棱柱单元")
+    if any(s.n_cells <= 0 or s.n_poly_cells <= 0 for s in summaries):
+        raise RuntimeError("部分流体域缺少体单元或 POLY 单元")
+    if not any(s.n_prism_cells > 0 for s in summaries):
+        print("警告: 未生成棱柱边界层，请检查已命名壁面范围和后端日志")
     return sum(s.n_cells for s in summaries)
 
 
@@ -193,7 +266,6 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--cad", type=Path, default=Path("FFF-2.scdoc"))
     p.add_argument("--out", type=Path, default=Path("FFF-2.msh"))
-    p.add_argument("--zones-json", type=Path, help='JSON: {"inlet":["*入口*"], ...}')
     return p.parse_args()
 
 
@@ -205,14 +277,6 @@ def main():
         raise FileNotFoundError(f"未找到模型: {args.cad.resolve()}")
     if args.out.suffix.lower() != ".msh":
         raise ValueError("输出必须使用 .msh 扩展名")
-    patterns = DEFAULT_PATTERNS
-    if args.zones_json:
-        patterns = json.loads(args.zones_json.read_text(encoding="utf-8"))
-        if set(patterns) != set(DEFAULT_PATTERNS) or any(
-            not isinstance(v, list) or not v or any(not isinstance(g, str) or not g for g in v)
-            for v in patterns.values()
-        ):
-            raise ValueError("映射必须包含 inlet/outlet/blades/volute，值为非空 glob 字符串列表")
     scale = 1.0
     last_count = None
     for attempt in range(1, MAX_ATTEMPTS+1):
@@ -224,19 +288,24 @@ def main():
                 prime.ImportCadParams(model, geometry_transfer=True)), "读取 CAD")
             if not model.parts:
                 raise RuntimeError("CAD 未导入任何部件")
-            faces = [int(f) for p in model.parts for f in p.get_topo_faces()]
-            low, high, extents = bounds(model, faces)
+            groups = load_named_zones(model)
+            zonelets = [int(z) for p in model.parts for z in geometry_zonelets(model, p)]
+            low, high, extents = bounds(model, zonelets)
             print(f"包围盒 min={low}, max={high}; 整体尺寸={extents}（CAD 导入单位）")
-            groups = identify_boundaries(model, patterns)
             features = []
-            for name in ("inlet", "outlet", "blades"):
-                ids = [f for fs in groups[name].values() for f in fs]
-                _, _, dims = bounds(model, ids)
-                features.extend(d for d in dims if d > max(extents)*1e-8)
+            for name in (*REFINED_REGIONS, "inlet", "outlet"):
+                ids = []
+                for part in model.parts:
+                    item = groups[name][part.id]
+                    ids.extend(geometry_zonelets(model, part, item['faces'])
+                               if item['faces'] else item['zonelets'])
+                if ids:
+                    _, _, dims = bounds(model, ids)
+                    features.extend(d for d in dims if d > max(extents)*1e-8)
             sizing = estimate_sizing(extents, features, scale)
             print(f"第 {attempt}/{MAX_ATTEMPTS} 次: {sizing}; 层数={LAYERS}")
-            create_boundaries(model, groups)
-            last_count = generate(model, sizing)
+            prepare_named_zones(model, groups)
+            last_count = generate(model, sizing, groups)
             print(f"实际体网格总数（含边界层）: {last_count}")
             if LOWER <= last_count <= UPPER:
                 args.out.parent.mkdir(parents=True, exist_ok=True)
