@@ -25,13 +25,13 @@ for n in ast.walk(tree):
         count += 1
 # Verify every method used with a Prime object against its real class signature.
 methods = {
- 'Model': ['delete_parts', 'create_zone', 'get_zone_name', 'set_global_sizing_params', 'delete_volumetric_size_fields'],
+ 'Model': ['merge_parts', 'get_part', 'delete_parts', 'create_zone', 'get_zone_name', 'set_global_sizing_params', 'delete_volumetric_size_fields'],
  'Part': ['get_labels','get_topo_faces','get_topo_edges','get_topo_volumes','get_face_zones',
           'get_volume_zones','get_topo_faces_of_label_name_pattern','get_topo_faces_of_zone_name_pattern',
           'remove_zone_on_topo_entities','remove_labels_from_topo_entities',
           'add_topo_entities_to_zone','add_labels_on_topo_entities','compute_topo_volumes',
           'get_summary','get_cell_zonelets'],
- 'TopoData': ['get_adjacent_topo_faces_of_topo_faces', 'get_geom_zonelets_of_topo_faces','get_geom_zonelets_of_topo_edges'],
+ 'TopoData': ['get_topo_edges_of_topo_faces', 'get_adjacent_topo_faces_of_topo_faces', 'get_geom_zonelets_of_topo_faces','get_geom_zonelets_of_topo_edges'],
  'ControlData': ['create_size_control','create_prism_control','create_volume_control'],
  'SizeControl': ['set_scope','set_curvature_sizing_params','set_proximity_sizing_params','set_soft_sizing_params'],
  'PrismControl': ['set_surface_scope','set_volume_scope','set_growth_params'],
@@ -42,7 +42,7 @@ methods = {
  'MeshInfo': ['get_face_and_edge_connectivity'],
  'SizeField': ['compute_volumetric'], 'AutoMesh': ['mesh'],
  'VolumeSearch': ['get_volume_quality_summary'],
- 'SurfaceSearch': ['get_surface_quality_summary'],
+ 'SurfaceSearch': ['get_surface_diagnostic_summary', 'get_surface_quality_summary'],
  'VolumeMeshTool': ['improve_by_auto_node_move'],
 }
 for cls, names in methods.items():

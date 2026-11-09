@@ -1,15 +1,15 @@
 Python syntax parsed with Python 3.11 grammar: PASS
 Import main workflow without launching Prime: PASS
-PyPrimeMesh 0.5.1: 41 constructor/call keyword checks: PASS
-45 Prime method existence/signature checks: PASS
+PyPrimeMesh 0.5.1: 48 constructor/call keyword checks: PASS
+49 Prime method existence/signature checks: PASS
 CLI defaults, scale invariance (1:1000), repair sizing reduction: PASS
 Prime server starts / CAD imports / meshing calls executed: ZERO
 Host check interpreter: 3.11.17 (offline Linux checks; Windows/Prime runtime not exercised)
 All checks passed!
 Python 3.11.17, pinned requirements.txt dependencies installed: PASS
-py_compile main workflow, verifier and coarse tests: PASS
-python -m unittest discover -s tests -v: 34 tests PASS
-Coarse path: one global sizing parameter set, zero SizeControl objects, zero curvature/proximity fields, zero prism controls: PASS (mocks)
-Cached empty auto scopes, metadata invalidation, heartbeat timeout diagnostics, communicator restoration, recognition-budget wall fallback: PASS
-Timeout threshold provides diagnostics only; an in-flight Prime RPC is not forcibly cancelled.
-All checks offline; real CAD recognition, mesh output and quality remain pending local validation.
+py_compile main workflow, verifier and global-surface tests: PASS
+python -m unittest discover -s tests -v: 42 tests PASS
+Global surface union: one Surfer owner/call, empty virtual containers skipped individually, topology preservation and source boundary mapping: PASS (mocks)
+Surface diagnostics: source/owner IDs, topo/mesh face counts, bulk CAD edge count and distinct meshed free-edge count: PASS (mocks)
+Fresh Prime/CAD context per surface retry, reduced size then Surfer defaults; no SizeControl or prism controls: PASS (mocks)
+No Prime server or CAD/meshing operations executed; global part merge, generated mesh and quality remain pending local validation.

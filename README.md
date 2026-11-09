@@ -47,9 +47,47 @@ python pump_mesh_auto.py --coarse --cad ./FFF-8.scdoc --output ./coarse_run --pr
 这个预算约束客户端几何分类，不会强行取消仍在执行的 Prime 几何查询。
 粗网格用于验证整条网格流程，不等于最终 CFD 生产网格。以下“自动网格与质量”章节中的局部控制和膨胀层仅适用于不带 `--coarse` 的原有精细路径。
 
+## 全局表面处理与 virtual flow domain
+
+粗网格不再逐个 volume zone/virtual part 调用 `mesh_topo_faces`。
+导入后先记录 part ID/name、topo face IDs/数量、topo volume IDs、volume zone 名和现有网格面数。
+`virtual_name_hint` 只是名称线索，不能把名称含 virtual 直接当成已证实的失败原因。
+`error_code` 与日志中的 `elapsed=0.125s` 是不同字段，耗时不是 Prime 错误码。
+
+排除 solid、完成自动边界命名后，使用 0.5.1 的 `Model.merge_parts` 将有几何或 topo volume 引用的流体
+**part 容器**汇总为 `auto_global_fluid_surface`；对有效 topo face 的去重并集只调用一次 Surfer。
+0.5.1 的 Surfer 必须有所属 part ID；不能捏造“无 part 的全模型 API”，也不能把任意全局 face 列表传给原 impeller part。
+高层 Lucid 的全模型范围内部仍会逐 part 调用，因此本路径明确使用容器汇总后的单一所属 part。
+
+这是 part 容器汇总，不调用 merge_volumes、布尔体合并、缝合或接口连接；
+汇总后严格核对 topo face 和 topo volume ID 集合，防止无声丢失真实几何区域。
+volume zone 名、独立接口两侧仍用于 Fluent 检查；汇总前后名称差异会报告，而不因名称不同直接中断。
+自动边界 CSV 保留原始 part/face 信息，增加 mesh_part_id、mesh_part_name 指向全局容器。
+粗网格的体质量摘要此时按全局 part 统计，不冒充原始区域逐区统计。
+
+无 topo faces 的 zone/part 记录为 `skip_individual_surface_call_no_topo_faces`，不单独划面网格。
+若含 topo volume 引用，可随其他有效几何一起汇总；完全无面/无体的 metadata part 留作追溯，不作为 Surfer 或体网格对象。
+几何尺寸测量也跳过无 topo faces/无关联几何 zonelets 的项，从其余全局几何取尺度。
+若**整个流体模型**都没有几何面，仍需报错：空的虚拟区域名称不能替代可划分的几何。
+
+表面失败默认额外重试两次，由 `surface_max_retries` 控制（0 可关闭，与质量重划次数分开计数）：
+
+1. 首次使用全局恒定尺寸。
+2. 失败后关闭该会话，重新启动 Prime、导入原始 CAD、重新识别和汇总，以更小全局尺寸重试。
+3. 再失败则在另一个新会话重新导入，以更小全局尺寸尝试 `SurferParams(model)` 的后端默认参数。
+
+默认参数尝试仍不创建 SizeControl 或 PrismControl，体网格仍为 CONSTANT/TET。
+重试不复用上一次已部分生成的面网格；单一全局尺寸和无膨胀层策略不变。
+默认参数不是保证成功的修复；全部失败会明确保留诊断并报错，不输出伪成功网格。
+
+失败诊断位于日志和 JSON 每次尝试的 surface_diagnostics 中，包含全局失败 part id/name、源 part 清单、
+topo face 数、已生成 face count、未网格化 topo face 数、网格自由边 boundary_edge_count 和 CAD 总边数 topo_edge_count。
+自由边通过 SurfaceSearch 的一次全局诊断获取；CAD 总边数用一次批量查询获取，不进行逐面 RPC 诊断循环。
+两种边数定义不同。查询不可用时填 null 并记录原因，不能填假零。
+
 ## 阶段日志、心跳与超时诊断
 
-主要阶段输出带时间戳的 `STAGE BEGIN/END` 和耗时；粗网格的每个部件分别输出 surface_mesh、volume_mesh 阶段。
+主要阶段输出带时间戳的 `STAGE BEGIN/END` 和耗时；粗网格输出全局 surface_mesh、全局 volume_mesh 和 part 容器汇总阶段。
 从 Prime 启动阶段起，后台每 **30 秒**记录 `HEARTBEAT`：当前阶段、阶段耗时、正在等待的 Prime 命令与该调用耗时。
 心跳线程只读本地状态，**不发送任何并发 Prime RPC**。
 

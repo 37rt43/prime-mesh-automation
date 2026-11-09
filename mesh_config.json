@@ -23,5 +23,6 @@
   "fluent_executable": null,
   "fluent_timeout_seconds": 1800,
   "coarse_diagonal_ratio": 0.03333333333333333,
-  "recognition_budget_seconds": 120
+  "recognition_budget_seconds": 120,
+  "surface_max_retries": 2
 }

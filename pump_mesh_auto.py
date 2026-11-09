@@ -31,12 +31,14 @@ WALLS = ()
 AUTO_FACE_SCOPES = {}
 AUTO_MAPPING = []
 AUTO_RECOGNITION = {}
+MESH_PART_IDS = None
 DEFAULTS = {
     'recognition_budget_seconds': 120,
     'recognition_contact_ratio': 1e-5,
     'recognition_contact_coverage': 0.98,
     'recognition_planarity_ratio': 1e-4,
     'recognition_samples': 128,
+    'surface_max_retries': 2,
     'coarse_diagonal_ratio': 1 / 30,
     'global_diagonal_ratio': 1 / 60,
     'minimum_global_ratio': 1 / 30,
@@ -769,7 +771,13 @@ def measure(model, coarse=False):
     measured = {}
     for p in model.parts:
         fs = list(cached_query(p, 'get_topo_faces'))
+        if not fs:
+            LOG.warning('Geometry measurement skips empty virtual/metadata part id=%s name=%s', p.id, p.name)
+            continue
         zs = list(cached_query(model.topo_data, 'get_geom_zonelets_of_topo_faces', fs))
+        if not zs:
+            LOG.warning('No associated geometry zonelets for part id=%s name=%s; use global geometry', p.id, p.name)
+            continue
         all_z.extend(zs)
         part = bbox(model, zs)
         spans = []
@@ -836,49 +844,203 @@ def scope(model, part=None, label='*', volume=False):
 
 
 
+class SurfaceMeshingFailure(RuntimeError):
+    def __init__(self, message, diagnostics):
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
+def numeric_count(value):
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+@timed_stage('imported topology and virtual-region inventory')
+def audit_imported_geometry(model):
+    rows = []
+    for p in model.parts:
+        fs = list(map(int, cached_query(p, 'get_topo_faces')))
+        vz = list(cached_query(p, 'get_volume_zones'))
+        names = [str(cached_query(model, 'get_zone_name', z)) for z in vz]
+        row = dict(part_id=p.id, part_name=p.name, topo_face_count=len(fs),
+                   topo_face_ids=fs, volume_zone_names=names,
+                   topo_volume_ids=list(map(int, cached_query(p, 'get_topo_volumes'))),
+                   virtual_name_hint=any('virtual' in n.casefold() for n in [p.name, *names]),
+                   surface_action='include_in_global_surface_union' if fs else
+                                  'skip_individual_surface_call_no_topo_faces',
+                   face_count=None, boundary_edge_count=None,
+                   boundary_edge_status='not_measured_before_surface_meshing')
+        try:
+            summary = p.get_summary(prime.PartSummaryParams(model))
+            row['face_count'] = numeric_count(summary.n_faces)
+        except Exception as exc:
+            row['summary_error'] = str(exc)
+        LOG.info('IMPORTED GEOMETRY %s', row)
+        if not fs:
+            LOG.warning('SKIP individual surface call: part id=%s name=%s has no topo faces; '
+                        'virtual/volume metadata retained for global geometry processing', p.id, p.name)
+        rows.append(row)
+    return rows
+
+
+@timed_stage('assemble global fluid surface owner')
+def global_surface_owner(model, diagnostics):
+    """Merge containers, not volumes or interfaces; Surfer requires one owner ID."""
+    global AUTO_FACE_SCOPES, MESH_PART_IDS
+    sources = audit_imported_geometry(model)
+    diagnostics['source_parts'] = sources
+    face_union = {fid for row in sources for fid in row['topo_face_ids']}
+    volume_union = {vid for row in sources for vid in row['topo_volume_ids']}
+    if not face_union:
+        raise RuntimeError('No valid topo faces anywhere in the fluid model; empty virtual metadata alone cannot be meshed')
+    old_ids = {row['part_id'] for row in sources
+               if row['topo_face_ids'] or row['topo_volume_ids']}
+    diagnostics['metadata_only_part_ids'] = sorted({row['part_id'] for row in sources}-old_ids)
+    if len(old_ids) > 1:
+        result = checked(model.merge_parts(sorted(old_ids), prime.MergePartsParams(
+            model, merged_part_suggested_name='auto_global_fluid_surface')), 'merge fluid part containers')
+        invalidate_queries()
+        owner = model.get_part(result.merged_part_id)
+        if owner is None:
+            raise RuntimeError('Merged fluid surface owner not returned by Prime')
+    else:
+        owner = next(p for p in model.parts if p.id in old_ids)
+    observed = set(map(int, cached_query(owner, 'get_topo_faces')))
+    observed_volumes = set(map(int, cached_query(owner, 'get_topo_volumes')))
+    if observed != face_union or observed_volumes != volume_union:
+        raise RuntimeError('Part container merge changed face/volume topology IDs; refusing to silently lose '
+                           f'boundaries/regions. faces before={len(face_union)} after={len(observed)}, '
+                           f'volumes before={len(volume_union)} after={len(observed_volumes)}')
+    new_scopes = {}
+    for (pid, name), fs in AUTO_FACE_SCOPES.items():
+        target = owner.id if pid in old_ids else pid
+        new_scopes.setdefault((target, name), set()).update(fs)
+    AUTO_FACE_SCOPES = new_scopes
+    for row in AUTO_MAPPING:
+        if row['original_part_id'] in old_ids:
+            row['mesh_part_id'], row['mesh_part_name'] = owner.id, owner.name
+    MESH_PART_IDS = {owner.id}
+    diagnostics.update(global_owner_id=owner.id, global_owner_name=owner.name,
+                       global_topo_face_count=len(face_union),
+                       global_topo_volume_count=len(volume_union),
+                       merge_policy='part containers only; no merge_volumes/stitch/connect')
+    after_names = {str(cached_query(model, 'get_zone_name', z))
+                   for z in cached_query(owner, 'get_volume_zones')}
+    before_names = {name for row in sources for name in row['volume_zone_names']}
+    diagnostics['volume_zone_names_after'] = sorted(after_names)
+    diagnostics['unretained_volume_zone_names'] = sorted(before_names-after_names)
+    if before_names-after_names:
+        LOG.warning('Volume names without retained zone membership after part merge: %s; '
+                    'volume topology has been checked, inspect imported metadata', before_names-after_names)
+    LOG.info('GLOBAL SURFACE OWNER id=%s name=%s topo_faces=%s topo_volumes=%s',
+             owner.id, owner.name, len(face_union), len(volume_union))
+    return owner
+
+
+def surface_failure_diagnostics(model, owner, error, diagnostics):
+    """Best effort diagnostics never hide the original meshing exception."""
+    fs = list(map(int, cached_query(owner, 'get_topo_faces')))
+    row = dict(part_id=owner.id, part_name=owner.name, topo_face_count=len(fs),
+               face_count=None, boundary_edge_count=None, topo_boundary_edge_count=None,
+               error=str(error), source_parts=diagnostics.get('source_parts', []))
+    LOG.error('SURFACE FAILURE part id=%s name=%s topo_face_count=%s error=%s',
+              owner.id, owner.name, len(fs), error)
+    try:
+        summary = owner.get_summary(prime.PartSummaryParams(model))
+        row['face_count'] = numeric_count(summary.n_faces)
+        row['unmeshed_topo_face_count'] = numeric_count(summary.n_unmeshed_topo_faces)
+    except Exception as exc:
+        row['summary_error'] = str(exc)
+    try:
+        # One bulk topology query. Do not add an O(number of faces) RPC loop
+        # while diagnosing a failed global call. This count is NOT free edges.
+        row['topo_edge_count'] = len(set(map(int, cached_query(
+            model.topo_data, 'get_topo_edges_of_topo_faces', fs))))
+    except Exception as exc:
+        row['topo_edge_query_error'] = str(exc)
+    try:
+        result = checked(prime.SurfaceSearch(model).get_surface_diagnostic_summary(
+            prime.SurfaceDiagnosticSummaryParams(model,
+                scope=prime.ScopeDefinition(model, part_expression=owner.name, zone_expression='*',
+                    entity_type=prime.ScopeEntity.FACEZONELETS,
+                    evaluation_type=prime.ScopeEvaluationType.ZONES),
+                compute_free_edges=True, compute_self_intersections=False,
+                compute_multi_edges=False, compute_duplicate_faces=False)), 'failed surface boundary edges')
+        row['boundary_edge_count'] = numeric_count(result.n_free_edges)
+        row['boundary_edge_status'] = 'meshed_surface_free_edges_not_CAD_topo_edges'
+    except Exception as exc:
+        row['boundary_edge_status'] = 'unavailable: '+str(exc)
+    diagnostics['failure'] = row
+    LOG.error('SURFACE FAILURE DIAGNOSTICS %s', row)
+    return row
+
+
+@timed_stage('coarse single global surface_mesh')
+def mesh_global_surface(model, owner, h, strategy, diagnostics):
+    faces = sorted(set(map(int, cached_query(owner, 'get_topo_faces'))))
+    if not faces:
+        LOG.warning('Global owner id=%s name=%s has no topo faces; no Surfer call issued', owner.id, owner.name)
+        return False
+    diagnostics['surface_strategy'] = strategy
+    try:
+        params = (prime.SurferParams(model) if strategy == 'default' else
+                  prime.SurferParams(model, size_field_type=prime.SizeFieldType.CONSTANT,
+                                     constant_size=h, generate_quads=False))
+        diagnostics['surfer_parameters'] = (params._jsonify() if hasattr(params, '_jsonify') else str(params))
+        LOG.info('ONE GLOBAL Surfer call owner=%s faces=%s strategy=%s global_size=%s',
+                 owner.id, len(faces), strategy, h)
+        checked(prime.Surfer(model).mesh_topo_faces(owner.id, faces, params), 'global coarse surface mesh')
+        summary = owner.get_summary(prime.PartSummaryParams(model))
+        if summary.n_unmeshed_topo_faces or summary.n_faces <= 0:
+            raise RuntimeError(f'Global surface meshing incomplete: {summary}')
+    except Exception as exc:
+        row = surface_failure_diagnostics(model, owner, exc, diagnostics)
+        raise SurfaceMeshingFailure('Global surface meshing failed: '+str(exc), row) from exc
+    return True
+
+
 @timed_stage('coarse global sizing and meshing')
-def mesh_coarse(model, sizes, cfg, members):
+def mesh_coarse(model, sizes, cfg, members, surface_strategy='constant', diagnostics=None):
+    diagnostics = diagnostics if diagnostics is not None else {}
     h = sizes['base']
-    # This is the ONE global sizing control. Zero SizeControl objects, zero
-    # soft/curvature/proximity setters, zero volumetric size-field computations.
     with phase('coarse: set single global sizing'):
         checked(model.set_global_sizing_params(prime.GlobalSizingParams(
             model, min=h, max=h, growth_rate=cfg['growth_rate'])), 'coarse global sizing')
-    for p in model.parts:
-        with phase('coarse surface_mesh '+p.name):
-            checked(prime.Surfer(model).mesh_topo_faces(p.id,
-                list(cached_query(p, 'get_topo_faces')), prime.SurferParams(model,
-                    size_field_type=prime.SizeFieldType.CONSTANT, constant_size=h,
-                    generate_quads=False)), 'coarse surface mesh '+p.name)
-            summary = p.get_summary(prime.PartSummaryParams(model))
-            if summary.n_unmeshed_topo_faces or summary.n_faces <= 0:
-                raise RuntimeError(f'{p.name}: coarse surface mesh incomplete: {summary}')
+    owner = global_surface_owner(model, diagnostics)
+    if not mesh_global_surface(model, owner, h, surface_strategy, diagnostics):
+        raise RuntimeError('No global geometric surface available for volume meshing')
     invalidate_queries()
     fills = {}
-    for p in model.parts:
-        with phase('coarse volume_mesh '+p.name):
-            if not len(cached_query(p, 'get_topo_volumes')):
-                checked(p.compute_topo_volumes(prime.ComputeVolumesParams(model)), 'coarse closed volumes')
-                invalidate_queries()
-            if not len(cached_query(p, 'get_topo_volumes')):
-                raise RuntimeError(p.name+': no closed fluid volume')
-            if not len(cached_query(p, 'get_volume_zones')):
-                z = checked(model.create_zone('auto_'+members[p.id]+'_fluid_'+str(p.id),
-                    prime.ZoneType.VOLUME), 'coarse fluid zone').zone_id
-                checked(p.add_topo_entities_to_zone(z, cached_query(p, 'get_topo_volumes')), 'coarse fluid membership')
-            vc = model.control_data.create_volume_control()
-            vc.set_params(prime.VolumeControlParams(model, cell_zonelet_type=prime.CellZoneletType.FLUID))
-            checked(vc.set_scope(scope(model, p.name, volume=True)), 'coarse fluid scope')
-            checked(prime.AutoMesh(model).mesh(p.id, prime.AutoMeshParams(model,
-                volume_fill_type=prime.VolumeFillType.TET, max_size=h,
-                size_field_type=prime.SizeFieldType.CONSTANT,
-                volume_control_ids=[vc.id], prism_control_ids=[])), 'coarse TET volume '+p.name)
-            summary = p.get_summary(prime.PartSummaryParams(model))
-            if summary.n_cells <= 0:
-                raise RuntimeError(p.name+': no coarse volume cells')
-            fills[p.id] = 'TET'
+    # One global part container now owns all retained fluid volume zones.
+    with phase('coarse global volume_mesh '+owner.name):
+        if not len(cached_query(owner, 'get_topo_volumes')):
+            checked(owner.compute_topo_volumes(prime.ComputeVolumesParams(model)), 'coarse closed volumes')
+            invalidate_queries()
+        if not len(cached_query(owner, 'get_topo_volumes')):
+            raise RuntimeError('Global fluid geometry has no closed volume')
+        if not len(cached_query(owner, 'get_volume_zones')):
+            z = checked(model.create_zone('auto_global_fluid', prime.ZoneType.VOLUME), 'coarse fluid zone').zone_id
+            checked(owner.add_topo_entities_to_zone(z, cached_query(owner, 'get_topo_volumes')), 'coarse fluid membership')
+        vc = model.control_data.create_volume_control()
+        vc.set_params(prime.VolumeControlParams(model, cell_zonelet_type=prime.CellZoneletType.FLUID))
+        checked(vc.set_scope(scope(model, owner.name, volume=True)), 'coarse global fluid scope')
+        checked(prime.AutoMesh(model).mesh(owner.id, prime.AutoMeshParams(model,
+            volume_fill_type=prime.VolumeFillType.TET, max_size=h,
+            size_field_type=prime.SizeFieldType.CONSTANT,
+            volume_control_ids=[vc.id], prism_control_ids=[])), 'coarse global TET volumes')
+        summary = owner.get_summary(prime.PartSummaryParams(model))
+        if summary.n_cells <= 0:
+            raise RuntimeError('Global owner has no coarse volume cells')
+        fills[owner.id] = 'TET'
     invalidate_queries()
     return fills
+
+
+def surface_retry_plan(failure_count):
+    # Initial constant attempt -> smaller constant -> smaller Surfer defaults.
+    return 'default' if failure_count >= 2 else 'constant'
 
 
 def coarse_sizing(geometry, cfg, iteration):
@@ -981,13 +1143,15 @@ def mesh(model, sizes, cfg, members, force_tet):
 
 @timed_stage('volume quality')
 def quality(model, cfg, target, iteration, stage):
+    active_parts = [p for p in model.parts if MESH_PART_IDS is None or p.id in MESH_PART_IDS]
+    quality_part = active_parts[0].name if MESH_PART_IDS is not None and len(active_parts) == 1 else None
     metric_names = ['INVERSEORTHOGONAL', 'SKEWNESS', 'ASPECTRATIO', 'ELEMENTQUALITY']
     limits = [1-target, cfg['max_skewness'], cfg['max_aspect_ratio'], cfg['min_element_quality']]
     results = checked(prime.VolumeSearch(model).get_volume_quality_summary(
         prime.VolumeQualitySummaryParams(model,
             cell_quality_measures=[getattr(prime.CellQualityMeasure, n) for n in metric_names],
-            scope=scope(model, volume=True), quality_limit=limits)), 'quality '+stage)
-    parts = {p.id: p.name for p in model.parts}
+            scope=scope(model, part=quality_part, volume=True), quality_limit=limits)), 'quality '+stage)
+    parts = {p.id: p.name for p in active_parts}
     rows, failed, seen = [], set(), set()
     for r in results.quality_results_part:
         n = r.cell_quality_measure.name
@@ -1009,7 +1173,7 @@ def quality(model, cfg, target, iteration, stage):
         if bad:
             failed.add(r.part_id)
             LOG.warning('Failed volume quality: %s', row)
-    expected = {(p.id, n) for p in model.parts for n in metric_names}
+    expected = {(p.id, n) for p in active_parts for n in metric_names}
     if seen != expected:
         raise RuntimeError(f'Incomplete quality results: missing={expected-seen}, extra={seen-expected}')
     return rows, failed
@@ -1140,7 +1304,7 @@ def configuration(path):
             raise ValueError('Unknown configuration keys or invalid JSON object')
         cfg.update(loaded)
     for key, val in cfg.items():
-        if key not in ('preferred_fill', 'fluent_executable'):
+        if key not in ('preferred_fill', 'fluent_executable', 'surface_max_retries'):
             if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val) or val <= 0:
                 raise ValueError('Configuration must be finite and positive: '+key)
     for key in ('coarse_diagonal_ratio', 'global_diagonal_ratio', 'minimum_global_ratio', 'local_span_ratio',
@@ -1152,9 +1316,11 @@ def configuration(path):
             raise ValueError('Ratio must be < 1: '+key)
     if not (1 < cfg['growth_rate'] <= 1.3 and 1 < cfg['prism_growth_rate'] <= 1.3):
         raise ValueError('Growth rates must lie in (1, 1.3]')
-    for key in ('prism_max_layers', 'elements_per_gap', 'fluent_timeout_seconds', 'recognition_samples'):
+    for key in ('prism_max_layers', 'elements_per_gap', 'fluent_timeout_seconds', 'recognition_samples', 'surface_max_retries'):
         if not isinstance(cfg[key], int):
             raise ValueError('Expected integer: '+key)
+    if isinstance(cfg['surface_max_retries'], bool) or cfg['surface_max_retries'] < 0:
+        raise ValueError('surface_max_retries must be a nonnegative integer')
     if cfg['preferred_fill'] not in ('POLY', 'HEXCOREPOLY', 'TET'):
         raise ValueError('preferred_fill must be POLY, HEXCOREPOLY or TET')
     return cfg
@@ -1168,7 +1334,7 @@ def import_geometry(model, cad):
 
 
 def run(argv=None):
-    global prime, MONITOR
+    global prime, MONITOR, MESH_PART_IDS
     args = arguments(argv)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -1201,14 +1367,18 @@ def run(argv=None):
         LOG.info('Python=%s, PyPrimeMesh=%s; CAD=%s', sys.version, prime.__version__, args.cad.resolve())
         for note in LIMITATIONS:
             LOG.warning(note)
+        surface_failures = quality_repairs = 0
         failed_parts, force_tet = set(), not hasattr(prime.VolumeFillType, cfg['preferred_fill'])
-        for iteration in range(args.max_iterations+1):
+        total_attempts = args.max_iterations+1+(cfg['surface_max_retries'] if args.coarse else 0)
+        for iteration in range(total_attempts):
             attempt = {'iteration': iteration, 'quality': []}
             report['attempts'].append(attempt)
             with phase('Prime session/startup'), launch_prime() as client, observe_prime_calls(client.model):
                 model = client.model
+                MESH_PART_IDS = None
                 invalidate_queries()
                 import_geometry(model, args.cad)
+                attempt['imported_geometry'] = audit_imported_geometry(model)
                 original, members = inspect_names(model, output, cfg)
                 report['automatic_recognition'] = AUTO_RECOGNITION
                 report['automatic_boundary_mapping'] = AUTO_MAPPING
@@ -1226,10 +1396,23 @@ def run(argv=None):
                 prepare_boundaries(model, coarse=args.coarse)
                 write_mapping(output)
                 try:
-                    attempt['fill_types'] = (mesh_coarse(model, sizes, cfg, members) if args.coarse
+                    attempt['surface_diagnostics'] = {}
+                    attempt['fill_types'] = (mesh_coarse(model, sizes, cfg, members,
+                        surface_strategy=surface_retry_plan(surface_failures),
+                        diagnostics=attempt['surface_diagnostics']) if args.coarse
                                              else mesh(model, sizes, cfg, members, force_tet))
                 except RuntimeError as exc:
                     attempt['meshing_error'] = str(exc)
+                    write_mapping(output)
+                    if isinstance(exc, SurfaceMeshingFailure) and args.coarse and surface_failures < cfg['surface_max_retries']:
+                        surface_failures += 1
+                        attempt['surface_retry'] = dict(number=surface_failures,
+                            next_strategy=surface_retry_plan(surface_failures), fresh_CAD_import=True,
+                            next_size_factor=cfg['refinement_factor'])
+                        LOG.exception('Global surface failed; restart Prime and reimport CAD, reduce global size; next strategy=%s',
+                                      surface_retry_plan(surface_failures))
+                        save_report(report, report_path, output)
+                        continue
                     if not args.coarse and not force_tet and iteration < args.max_iterations:
                         LOG.exception('Mesh attempt failed; reimport original CAD and retry TET')
                         force_tet = True
@@ -1237,6 +1420,7 @@ def run(argv=None):
                         save_report(report, report_path, output)
                         continue
                     raise
+                write_mapping(output)
                 rows, failed = quality(model, cfg, args.target_orthogonal_quality, iteration, 'initial')
                 attempt['quality'].extend(rows)
                 if failed:
@@ -1258,6 +1442,10 @@ def run(argv=None):
                     report['validation'] = 'Prime part-level checks passed; Fluent inspection still required'
                     LOG.info('Export completed; this is not certification of unsupported local diagnostics')
                     return 0
+                if args.coarse:
+                    if quality_repairs >= args.max_iterations:
+                        raise RuntimeError('Coarse volume quality repair limit exhausted')
+                    quality_repairs += 1
                 failed_parts = {p.name for p in model.parts if p.id in failed}
                 LOG.warning('Reimport/remesh failed parts with reduced sizing and prism height: %s', failed_parts)
             save_report(report, report_path, output)
