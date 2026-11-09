@@ -8,6 +8,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+from contextlib import contextmanager
+import faulthandler
+from functools import wraps
+import threading
+import time
 import importlib.metadata
 import json
 import logging
@@ -27,10 +32,12 @@ AUTO_FACE_SCOPES = {}
 AUTO_MAPPING = []
 AUTO_RECOGNITION = {}
 DEFAULTS = {
+    'recognition_budget_seconds': 120,
     'recognition_contact_ratio': 1e-5,
     'recognition_contact_coverage': 0.98,
     'recognition_planarity_ratio': 1e-4,
     'recognition_samples': 128,
+    'coarse_diagonal_ratio': 1 / 30,
     'global_diagonal_ratio': 1 / 60,
     'minimum_global_ratio': 1 / 30,
     'local_span_ratio': 1 / 24,
@@ -71,6 +78,143 @@ LOG = logging.getLogger('pump_mesh')
 prime: Any = None
 
 
+MONITOR = None
+QUERY_CACHE = {}
+QUERY_OWNERS = {}
+
+
+def cached_query(owner, method, *args):
+    """Cache read-only CAD metadata within one import/model generation."""
+    def freeze(value):
+        if isinstance(value, (list, tuple)) or hasattr(value, 'tolist'):
+            return tuple(freeze(v) for v in value)
+        return value
+    QUERY_OWNERS[id(owner)] = owner  # prevent object-ID reuse while metadata is cached
+    key = (id(owner), method, tuple(freeze(a) for a in args))
+    if key not in QUERY_CACHE:
+        QUERY_CACHE[key] = getattr(owner, method)(*args)
+    return QUERY_CACHE[key]
+
+
+def invalidate_queries():
+    QUERY_CACHE.clear()
+    QUERY_OWNERS.clear()
+
+
+class RuntimeMonitor:
+    """Diagnostics only: never run concurrent Prime RPCs or kill a busy server."""
+    def __init__(self, output, timeout, interval=30):
+        self.output, self.timeout, self.interval = output, timeout, interval
+        self.lock, self.stop_event = threading.RLock(), threading.Event()
+        self.stages, self.calls, self.warned = [], [], set()
+        self.thread = None
+
+    def start(self):
+        self.thread = threading.Thread(target=self.watch, name='meshing-heartbeat', daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+
+    @contextmanager
+    def activity(self, name, rpc=False):
+        entry = (name, time.monotonic())
+        stack = self.calls if rpc else self.stages
+        with self.lock:
+            stack.append(entry)
+        LOG.log(logging.DEBUG if rpc else logging.INFO, '%s BEGIN %s', 'PRIME' if rpc else 'STAGE', name)
+        status = 'OK'
+        try:
+            yield
+        except BaseException:
+            status = 'FAILED'
+            raise
+        finally:
+            LOG.log(logging.DEBUG if rpc else logging.INFO, '%s END %s status=%s elapsed=%.3fs',
+                    'PRIME' if rpc else 'STAGE', name, status, time.monotonic()-entry[1])
+            with self.lock:
+                stack.remove(entry)
+
+    def snapshot(self):
+        with self.lock:
+            now = time.monotonic()
+            stage = self.stages[-1] if self.stages else ('idle', now)
+            call = self.calls[-1] if self.calls else ('none', now)
+            return dict(stage=stage[0], stage_elapsed_seconds=now-stage[1],
+                        prime_call=call[0], prime_call_elapsed_seconds=now-call[1],
+                        timeout_diagnostic_seconds=self.timeout, timeout_is_diagnostic_only=True)
+
+    def pulse(self):
+        state = self.snapshot()
+        LOG.info('HEARTBEAT stage=%s elapsed=%.1fs Prime=%s call_elapsed=%.1fs',
+                 state['stage'], state['stage_elapsed_seconds'], state['prime_call'],
+                 state['prime_call_elapsed_seconds'])
+        with self.lock:
+            active = self.calls[-1] if self.calls else (self.stages[-1] if self.stages else None)
+        if active and time.monotonic()-active[1] >= self.timeout and active not in self.warned:
+            self.warned.add(active)
+            LOG.error('TIMEOUT DIAGNOSTIC: %s exceeded %.1fs; server may still be working. '
+                      'No concurrent RPC/retry/cancellation is issued. Inspect Prime CPU/logs and stacks.',
+                      active[0], self.timeout)
+            with (self.output/'prime_timeout_stacks.txt').open('a') as stream:
+                faulthandler.dump_traceback(file=stream, all_threads=True)
+        temp = self.output/'prime_runtime_status.json.tmp'
+        temp.write_text(json.dumps(state, indent=2), encoding='utf-8')
+        temp.replace(self.output/'prime_runtime_status.json')
+
+    def watch(self):
+        while not self.stop_event.wait(self.interval):
+            try:
+                self.pulse()
+            except Exception:
+                LOG.exception('Heartbeat diagnostics failed; meshing thread remains untouched')
+
+
+@contextmanager
+def phase(name):
+    if MONITOR is None:
+        yield
+    else:
+        with MONITOR.activity(name):
+            yield
+
+
+def timed_stage(name):
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            with phase(name):
+                return function(*args, **kwargs)
+        return wrapped
+    return decorate
+
+
+@contextmanager
+def observe_prime_calls(model):
+    """0.5.1 communicator hooks add diagnostics, not unsupported RPC timeout kwargs."""
+    comm = model._communicator
+    originals = {}
+    try:
+        for method in ('serve', 'initialize_params', 'import_cad'):
+            if not hasattr(comm, method):
+                continue
+            original = getattr(comm, method)
+            originals[method] = original
+            def wrapped(*args, _original=original, _method=method, **kwargs):
+                command = str(args[1]) if len(args) > 1 else _method
+                if MONITOR is None:
+                    return _original(*args, **kwargs)
+                with MONITOR.activity(_method+': '+command, rpc=True):
+                    return _original(*args, **kwargs)
+            setattr(comm, method, wrapped)
+        yield
+    finally:
+        for method, original in originals.items():
+            setattr(comm, method, original)
+
+
 def checked(result, operation):
     """Never discard a returned server error or warning."""
     LOG.info('%s: %s', operation, result)
@@ -105,14 +249,20 @@ def save_report(report, path, output):
 
 
 def face_ids(model, part, name):
+    if name in BOUNDARIES:
+        return set(AUTO_FACE_SCOPES.get((part.id, name), set()))
     if (part.id, name) in AUTO_FACE_SCOPES:
         return set(AUTO_FACE_SCOPES[(part.id, name)])
+    lookup_key = ('original_faces', id(part), name)
+    if lookup_key in QUERY_CACHE:
+        return set(QUERY_CACHE[lookup_key])
     params = prime.NamePatternParams(model)
     faces = set()
-    if name in part.get_labels():
-        faces.update(map(int, part.get_topo_faces_of_label_name_pattern(name, params)))
-    if any(model.get_zone_name(z) == name for z in part.get_face_zones()):
-        faces.update(map(int, part.get_topo_faces_of_zone_name_pattern(name, params)))
+    if name in cached_query(part, 'get_labels'):
+        faces.update(map(int, cached_query(part, 'get_topo_faces_of_label_name_pattern', name, params)))
+    if any(cached_query(model, 'get_zone_name', z) == name for z in cached_query(part, 'get_face_zones')):
+        faces.update(map(int, cached_query(part, 'get_topo_faces_of_zone_name_pattern', name, params)))
+    QUERY_CACHE[lookup_key] = frozenset(faces)
     return faces
 
 
@@ -120,13 +270,22 @@ def inventory(model):
     result = []
     for part in model.parts:
         result.append({'part_id': part.id, 'part': part.name,
-                       'labels': list(part.get_labels()),
-                       'face_zones': [model.get_zone_name(z) for z in part.get_face_zones()],
-                       'volume_zones': [model.get_zone_name(z) for z in part.get_volume_zones()]})
+                       'labels': list(cached_query(part, 'get_labels')),
+                       'face_zones': [cached_query(model, 'get_zone_name', z) for z in cached_query(part, 'get_face_zones')],
+                       'volume_zones': [cached_query(model, 'get_zone_name', z) for z in cached_query(part, 'get_volume_zones')]})
     return result
 
 
 # Automatic boundary recognition uses CAD display facets, not a generated mesh.
+class RecognitionBudgetExceeded(RuntimeError):
+    pass
+
+
+def recognition_checkpoint(deadline):
+    if deadline is not None and time.monotonic() >= deadline:
+        raise RecognitionBudgetExceeded('automatic classification CPU budget reached')
+
+
 def facet_descriptor(points, polygons):
     """Measure a CAD face using VTK-style count-prefixed facet connectivity."""
     import numpy as np
@@ -170,7 +329,7 @@ def facet_descriptor(points, polygons):
                 radius=float(radii.max()), measurement_status='CAD_display_facets_approximate')
 
 
-def surface_distance(points, triangles):
+def surface_distance(points, triangles, deadline=None):
     """Exact point-to-triangle distances for the supplied tessellated surfaces."""
     import numpy as np
     t = np.asarray(triangles, dtype=float).reshape((-1, 3, 3))
@@ -181,6 +340,7 @@ def surface_distance(points, triangles):
         # Chunk triangle work to bound memory even on heavily faceted CAD.
         best = float('inf')
         for start in range(0, len(t), 4096):
+            recognition_checkpoint(deadline)
             chunk = t[start:start+4096]
             a, b, c = chunk[:, 0], chunk[:, 1], chunk[:, 2]
             ab, ac, ap = b-a, c-a, point-a
@@ -211,7 +371,7 @@ def surface_distance(points, triangles):
     return np.asarray(distances)
 
 
-def contact_coverage(face, others, tolerance, samples):
+def contact_coverage(face, others, tolerance, samples, deadline=None):
     """Area-weighted deterministic facet samples; not a bbox-only contact test."""
     import numpy as np
     if not others or not len(face['triangles']):
@@ -225,7 +385,7 @@ def contact_coverage(face, others, tolerance, samples):
     centroids = tri[ids].mean(axis=1)
     # Vertices catch sliver overhangs missed by centroid tests.
     probes = np.concatenate((centroids, tri[ids].reshape((-1, 3))))
-    distances = surface_distance(probes, targets)
+    distances = surface_distance(probes, targets, deadline=deadline)
     return float(np.mean(distances <= tolerance))
 
 
@@ -295,7 +455,7 @@ def infer_regions(parts, faces, contacts):
     return result, geometry
 
 
-def classify_boundary_faces(parts, faces, cfg):
+def classify_boundary_faces(parts, faces, cfg, deadline=None):
     """Pure geometry classifier. Every fluid CAD face receives exactly one zone."""
     import numpy as np
     all_points = [f['points'] for f in faces.values() if len(f['points'])]
@@ -305,6 +465,7 @@ def classify_boundary_faces(parts, faces, cfg):
     keys = sorted(faces)
     candidates = {k: [] for k in keys}
     for i, a in enumerate(keys):
+        recognition_checkpoint(deadline)
         f = faces[a]
         if not len(f['triangles']):
             continue
@@ -318,15 +479,16 @@ def classify_boundary_faces(parts, faces, cfg):
             candidates[b].append(a)
     coverage, contacts = {}, set()
     for key in keys:
+        recognition_checkpoint(deadline)
         coverage[key] = contact_coverage(faces[key], [faces[k] for k in candidates[key]],
-                                        tolerance, cfg['recognition_samples'])
+                                        tolerance, cfg['recognition_samples'], deadline=deadline)
     fully_covered = {k for k in keys if coverage[k] >= cfg['recognition_contact_coverage']}
     for a in fully_covered:
         for b in candidates[a]:
             if b in fully_covered:
                 # Reject bbox-only overlaps: each pair must actually touch.
                 if contact_coverage(faces[a], [faces[b]], tolerance,
-                                    cfg['recognition_samples']) > 0:
+                                    cfg['recognition_samples'], deadline=deadline) > 0:
                     contacts.add(tuple(sorted((a, b))))
     regions, region_geometry = infer_regions(parts, faces, contacts)
     assignments = {}
@@ -420,16 +582,17 @@ def classify_boundary_faces(parts, faces, cfg):
         contact_coverage={f'{k[0]}:{k[1]}': v for k, v in coverage.items()})
 
 
+@timed_stage('CAD display facets')
 def read_cad_faces(model):
     """Read geometry-display facets (also available before surface meshing)."""
     import numpy as np
     faces = {}
     for p in model.parts:
-        labels = {n: face_ids(model, p, n) for n in p.get_labels()}
-        for fid in map(int, p.get_topo_faces()):
+        labels = {n: face_ids(model, p, n) for n in cached_query(p, 'get_labels')}
+        for fid in map(int, cached_query(p, 'get_topo_faces')):
             faces[(p.id, fid)] = dict(points=np.empty((0, 3)), triangles=np.empty((0, 3, 3)),
                 area=None, original_labels=[n for n, fs in labels.items() if fid in fs],
-                adjacent_faces=list(map(int, model.topo_data.get_adjacent_topo_faces_of_topo_faces([fid]))),
+                adjacent_faces=list(map(int, cached_query(model.topo_data, 'get_adjacent_topo_faces_of_topo_faces', [fid]))),
                 measurement_status='no_display_facets_default_wall')
     try:
         result = prime.MeshInfo(model).get_face_and_edge_connectivity(
@@ -460,11 +623,13 @@ def read_cad_faces(model):
     return faces
 
 
+@timed_stage('automatic boundary recognition')
 def inspect_names(model, output, cfg=None):
     """Historical entry name; now performs automatic recognition, never name validation."""
     global BOUNDARIES, WALLS, AUTO_FACE_SCOPES, AUTO_MAPPING, AUTO_RECOGNITION
     cfg = cfg or DEFAULTS
     BOUNDARIES, WALLS, AUTO_FACE_SCOPES = (), (), {}
+    invalidate_queries()
     original = inventory(model)
     excluded = []
     for p in original:
@@ -475,13 +640,23 @@ def inspect_names(model, output, cfg=None):
             excluded.append(p['part_id'])
     if excluded:
         checked(model.delete_parts(excluded), 'exclude explicit solid CAD bodies')
+        invalidate_queries()
     if not model.parts:
         raise ValueError('No fluid candidate bodies remain after excluding solids')
     parts = {p['part_id']: p for p in inventory(model)}
     faces = read_cad_faces(model)
     if not faces:
         raise RuntimeError('Imported CAD has no topology faces to mesh')
-    assignments, regions, details = classify_boundary_faces(parts, faces, cfg)
+    try:
+        assignments, regions, details = classify_boundary_faces(parts, faces, cfg,
+            deadline=time.monotonic()+cfg['recognition_budget_seconds'])
+    except RecognitionBudgetExceeded:
+        LOG.warning('Automatic recognition CPU budget exceeded; all faces fall back to uncertain wall')
+        regions, _ = infer_regions(parts, faces, [])
+        assignments = {key: dict(zone='auto_'+regions[key[0]]['role']+'_wall', type='wall',
+            uncertain=True, interface_pair=None, reason='recognition CPU budget exceeded; conservative wall fallback')
+            for key in faces}
+        details = dict(recognition_budget_exceeded=True, port_candidates=0, interface_pairs=0)
     AUTO_MAPPING = []
     for key, assignment in sorted(assignments.items()):
         pid, fid = key
@@ -522,14 +697,15 @@ def write_mapping(output):
             writer.writerows(AUTO_MAPPING)
 
 
-def prepare_boundaries(model):
+@timed_stage('boundary zone assignment')
+def prepare_boundaries(model, coarse=False):
     """Assign each CAD face once, tolerating server-suggested name collisions."""
     global BOUNDARIES, WALLS, AUTO_FACE_SCOPES
     renamed, new_scopes = {}, {}
     old_walls = set(WALLS)
     for name in BOUNDARIES:
         zone = checked(model.create_zone(name, prime.ZoneType.FACE), 'create automatic '+name).zone_id
-        actual = model.get_zone_name(zone)
+        actual = cached_query(model, 'get_zone_name', zone)
         renamed[name] = actual
         for p in model.parts:
             fs = sorted(AUTO_FACE_SCOPES.get((p.id, name), set()))
@@ -537,7 +713,8 @@ def prepare_boundaries(model):
                 continue
             checked(p.remove_zone_on_topo_entities(fs), 'replace old face zone membership')
             checked(p.add_topo_entities_to_zone(zone, fs), 'assign automatic '+actual)
-            checked(p.add_labels_on_topo_entities(['__pump_all', '__pump_'+actual], fs), 'auto sizing labels')
+            if not coarse:
+                checked(p.add_labels_on_topo_entities(['__pump_all', '__pump_'+actual], fs), 'auto sizing labels')
             new_scopes[(p.id, actual)] = set(fs)
     # Update all aliases simultaneously: a suggested name may equal a future
     # requested name, so in-place sequential replacement would lose scopes.
@@ -547,22 +724,27 @@ def prepare_boundaries(model):
     AUTO_FACE_SCOPES = new_scopes
     BOUNDARIES = tuple(renamed.values())
     WALLS = tuple(renamed[n] for n in old_walls)
+    invalidate_queries()
+    if coarse:
+        return
     for p in model.parts:
-        fs = list(map(int, p.get_topo_faces()))
-        if '__pump_wall' in p.get_labels():
+        fs = list(map(int, cached_query(p, 'get_topo_faces')))
+        if '__pump_wall' in cached_query(p, 'get_labels'):
             checked(p.remove_labels_from_topo_entities(['__pump_wall'], fs), 'reset prism scope')
         wall_faces = sorted({fid for n in WALLS for fid in AUTO_FACE_SCOPES.get((p.id, n), set())})
         if wall_faces:
             checked(p.add_labels_on_topo_entities(['__pump_wall'], wall_faces), 'exclusive auto wall prism scope')
+    invalidate_queries()
 
 
-def verify_auto_boundaries(model):
+@timed_stage('boundary validation')
+def verify_auto_boundaries(model, coarse=False):
     for p in model.parts:
-        actual = set(map(int, p.get_topo_faces()))
+        actual = set(map(int, cached_query(p, 'get_topo_faces')))
         assigned = [fid for (pid, _), fs in AUTO_FACE_SCOPES.items() if pid == p.id for fid in fs]
         if set(assigned) != actual or len(assigned) != len(actual):
             raise RuntimeError(f'{p.name}: automatic assignment coverage changed during meshing')
-        for name in BOUNDARIES:
+        for name in (() if coarse else BOUNDARIES):
             expected = AUTO_FACE_SCOPES.get((p.id, name), set())
             if expected:
                 observed = set(map(int, p.get_topo_faces_of_zone_name_pattern(name, prime.NamePatternParams(model))))
@@ -581,19 +763,20 @@ def bbox(model, zonelets):
     return {'low': low, 'high': high, 'extents': [v-u for u, v in zip(low, high)]}
 
 
-def measure(model):
+@timed_stage('geometry measurement')
+def measure(model, coarse=False):
     all_z = []
     measured = {}
     for p in model.parts:
-        fs = list(p.get_topo_faces())
-        zs = list(model.topo_data.get_geom_zonelets_of_topo_faces(fs))
+        fs = list(cached_query(p, 'get_topo_faces'))
+        zs = list(cached_query(model.topo_data, 'get_geom_zonelets_of_topo_faces', fs))
         all_z.extend(zs)
         part = bbox(model, zs)
         spans = []
         # Use each edge's diagonal, never its smallest Cartesian extent: a
         # tilted planar face's bbox thickness is not a physical clearance.
-        for e in p.get_topo_edges():
-            ez = list(model.topo_data.get_geom_zonelets_of_topo_edges([int(e)]))
+        for e in (() if coarse else cached_query(p, 'get_topo_edges')):
+            ez = list(cached_query(model.topo_data, 'get_geom_zonelets_of_topo_edges', [int(e)]))
             if ez:
                 ext = bbox(model, ez)['extents']
                 length = math.sqrt(sum(v*v for v in ext))
@@ -601,10 +784,10 @@ def measure(model):
                     spans.append(length)
         part['edge_bbox_diagonals'] = spans
         part['boundaries'] = {}
-        for n in BOUNDARIES:
+        for n in (() if coarse else BOUNDARIES):
             faces = face_ids(model, p, n)
             if faces:
-                z = list(model.topo_data.get_geom_zonelets_of_topo_faces(sorted(faces)))
+                z = list(cached_query(model.topo_data, 'get_geom_zonelets_of_topo_faces', sorted(faces)))
                 part['boundaries'][n] = bbox(model, z)
         measured[p.id] = part
     return {'overall': bbox(model, all_z), 'parts': measured,
@@ -653,6 +836,65 @@ def scope(model, part=None, label='*', volume=False):
 
 
 
+@timed_stage('coarse global sizing and meshing')
+def mesh_coarse(model, sizes, cfg, members):
+    h = sizes['base']
+    # This is the ONE global sizing control. Zero SizeControl objects, zero
+    # soft/curvature/proximity setters, zero volumetric size-field computations.
+    with phase('coarse: set single global sizing'):
+        checked(model.set_global_sizing_params(prime.GlobalSizingParams(
+            model, min=h, max=h, growth_rate=cfg['growth_rate'])), 'coarse global sizing')
+    for p in model.parts:
+        with phase('coarse surface_mesh '+p.name):
+            checked(prime.Surfer(model).mesh_topo_faces(p.id,
+                list(cached_query(p, 'get_topo_faces')), prime.SurferParams(model,
+                    size_field_type=prime.SizeFieldType.CONSTANT, constant_size=h,
+                    generate_quads=False)), 'coarse surface mesh '+p.name)
+            summary = p.get_summary(prime.PartSummaryParams(model))
+            if summary.n_unmeshed_topo_faces or summary.n_faces <= 0:
+                raise RuntimeError(f'{p.name}: coarse surface mesh incomplete: {summary}')
+    invalidate_queries()
+    fills = {}
+    for p in model.parts:
+        with phase('coarse volume_mesh '+p.name):
+            if not len(cached_query(p, 'get_topo_volumes')):
+                checked(p.compute_topo_volumes(prime.ComputeVolumesParams(model)), 'coarse closed volumes')
+                invalidate_queries()
+            if not len(cached_query(p, 'get_topo_volumes')):
+                raise RuntimeError(p.name+': no closed fluid volume')
+            if not len(cached_query(p, 'get_volume_zones')):
+                z = checked(model.create_zone('auto_'+members[p.id]+'_fluid_'+str(p.id),
+                    prime.ZoneType.VOLUME), 'coarse fluid zone').zone_id
+                checked(p.add_topo_entities_to_zone(z, cached_query(p, 'get_topo_volumes')), 'coarse fluid membership')
+            vc = model.control_data.create_volume_control()
+            vc.set_params(prime.VolumeControlParams(model, cell_zonelet_type=prime.CellZoneletType.FLUID))
+            checked(vc.set_scope(scope(model, p.name, volume=True)), 'coarse fluid scope')
+            checked(prime.AutoMesh(model).mesh(p.id, prime.AutoMeshParams(model,
+                volume_fill_type=prime.VolumeFillType.TET, max_size=h,
+                size_field_type=prime.SizeFieldType.CONSTANT,
+                volume_control_ids=[vc.id], prism_control_ids=[])), 'coarse TET volume '+p.name)
+            summary = p.get_summary(prime.PartSummaryParams(model))
+            if summary.n_cells <= 0:
+                raise RuntimeError(p.name+': no coarse volume cells')
+            fills[p.id] = 'TET'
+    invalidate_queries()
+    return fills
+
+
+def coarse_sizing(geometry, cfg, iteration):
+    d = math.sqrt(sum(v*v for v in geometry['overall']['extents']))
+    if not math.isfinite(d) or d <= 0:
+        raise ValueError('Invalid geometry diagonal')
+    h = d*cfg['coarse_diagonal_ratio']*cfg['refinement_factor']**iteration
+    result = dict(mode='coarse', diagonal=d, base=h, growth_rate=cfg['growth_rate'],
+                  global_control_count=1, size_control_object_count=0,
+                  local_controls=0, curvature=False, proximity=False,
+                  prism_layers=0, length_basis='overall bbox diagonal * coarse_diagonal_ratio * refinement_factor**iteration')
+    LOG.info('Coarse sizing: %s', result)
+    return result
+
+
+@timed_stage('refined mesh')
 def mesh(model, sizes, cfg, members, force_tet):
     minimum = min(v['minimum'] for v in sizes['parts'].values())
     model.set_global_sizing_params(prime.GlobalSizingParams(model,
@@ -696,19 +938,19 @@ def mesh(model, sizes, cfg, members, force_tet):
     try:
         for p in model.parts:
             s = sizes['parts'][p.id]
-            if not len(p.get_topo_volumes()):
+            if not len(cached_query(p, 'get_topo_volumes')):
                 checked(p.compute_topo_volumes(prime.ComputeVolumesParams(model)), 'closed fluid volumes')
-            if not len(p.get_topo_volumes()):
+            if not len(cached_query(p, 'get_topo_volumes')):
                 raise ValueError(f'{p.name}: no closed fluid volume')
-            if not len(p.get_volume_zones()):
+            if not len(cached_query(p, 'get_volume_zones')):
                 name = 'auto_'+members[p.id]+'_fluid_'+str(p.id)
                 z = checked(model.create_zone(name, prime.ZoneType.VOLUME), 'fluid '+name).zone_id
-                checked(p.add_topo_entities_to_zone(z, p.get_topo_volumes()), 'fluid membership')
+                checked(p.add_topo_entities_to_zone(z, cached_query(p, 'get_topo_volumes')), 'fluid membership')
             vc = model.control_data.create_volume_control()
             vc.set_params(prime.VolumeControlParams(model, cell_zonelet_type=prime.CellZoneletType.FLUID))
             checked(vc.set_scope(scope(model, p.name, volume=True)), 'fluid volume scope')
             prism_ids = []
-            if '__pump_wall' in p.get_labels():
+            if '__pump_wall' in cached_query(p, 'get_labels'):
                 pc = model.control_data.create_prism_control()
                 checked(pc.set_surface_scope(scope(model, p.name, '__pump_wall')), 'wall-only prism')
                 checked(pc.set_volume_scope(scope(model, p.name, volume=True)), 'prism volume')
@@ -737,6 +979,7 @@ def mesh(model, sizes, cfg, members, force_tet):
     return fills
 
 
+@timed_stage('volume quality')
 def quality(model, cfg, target, iteration, stage):
     metric_names = ['INVERSEORTHOGONAL', 'SKEWNESS', 'ASPECTRATIO', 'ELEMENTQUALITY']
     limits = [1-target, cfg['max_skewness'], cfg['max_aspect_ratio'], cfg['min_element_quality']]
@@ -791,6 +1034,7 @@ def surface_diagnostics(model):
     return diagnostics
 
 
+@timed_stage('quality smoothing')
 def smooth(model, failed, target):
     for p in model.parts:
         if p.id in failed:
@@ -804,6 +1048,7 @@ def smooth(model, failed, target):
 
 
 
+@timed_stage('Fluent export')
 def export_fluent_mesh(model, output, cfg):
     raw = output/'pump.msh'
     checked(prime.FileIO(model).export_fluent_meshing_mesh(str(raw),
@@ -866,6 +1111,9 @@ def convert_hdf5(raw, output, cfg):
 
 def arguments(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--coarse', action='store_true', help='constant global sizing, TET, no local controls or prisms')
+    p.add_argument('--prime-timeout', type=float, default=900,
+                   help='diagnostic threshold per Prime call/stage in seconds; does not cancel server')
     p.add_argument('--cad', type=Path, default=Path('./FFF-8.scdoc'))
     p.add_argument('--output', type=Path, default=Path('./output'))
     p.add_argument('--target-orthogonal-quality', type=float, default=0.1)
@@ -877,6 +1125,8 @@ def arguments(argv=None):
     args = p.parse_args(argv)
     if not 0.1 <= args.target_orthogonal_quality < 1:
         p.error('--target-orthogonal-quality must be >= 0.1 and < 1')
+    if not math.isfinite(args.prime_timeout) or args.prime_timeout <= 0:
+        p.error('--prime-timeout must be finite and positive')
     if args.max_iterations < 0:
         p.error('--max-iterations must be >= 0')
     return args
@@ -893,7 +1143,7 @@ def configuration(path):
         if key not in ('preferred_fill', 'fluent_executable'):
             if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val) or val <= 0:
                 raise ValueError('Configuration must be finite and positive: '+key)
-    for key in ('global_diagonal_ratio', 'minimum_global_ratio', 'local_span_ratio',
+    for key in ('coarse_diagonal_ratio', 'global_diagonal_ratio', 'minimum_global_ratio', 'local_span_ratio',
                 'wall_global_ratio', 'port_global_ratio', 'refinement_factor',
                 'prism_first_to_local_ratio', 'prism_total_to_local_ratio',
                 'max_skewness', 'min_element_quality', 'recognition_contact_ratio',
@@ -910,8 +1160,15 @@ def configuration(path):
     return cfg
 
 
+@timed_stage('import CAD')
+def import_geometry(model, cad):
+    return checked(prime.FileIO(model).import_cad(str(cad.resolve()),
+        prime.ImportCadParams(model, geometry_transfer=True,
+                              part_creation_type=prime.PartCreationType.BODY)), 'import CAD')
+
+
 def run(argv=None):
-    global prime
+    global prime, MONITOR
     args = arguments(argv)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -925,8 +1182,12 @@ def run(argv=None):
     report = {'status': 'started', 'cad': str(args.cad.resolve()), 'attempts': [],
               'limitations': LIMITATIONS, 'validation': 'local execution required',
               'precise_feature_volume_statistics': None, 'actual_prism_thickness': None}
-    save_report(report, report_path, output)
+    report['mode'] = 'coarse' if args.coarse else 'refined'
+    report['timeout_policy'] = 'diagnostic only; no unsafe concurrent Prime cancellation/retry'
+    MONITOR = RuntimeMonitor(output, args.prime_timeout)
+    MONITOR.start()
     try:
+        save_report(report, report_path, output)
         if not args.cad.is_file():
             raise FileNotFoundError(f'CAD file not found: {args.cad.resolve()}')
         if sys.version_info[:2] != (3, 11):
@@ -944,15 +1205,14 @@ def run(argv=None):
         for iteration in range(args.max_iterations+1):
             attempt = {'iteration': iteration, 'quality': []}
             report['attempts'].append(attempt)
-            with launch_prime() as client:
+            with phase('Prime session/startup'), launch_prime() as client, observe_prime_calls(client.model):
                 model = client.model
-                checked(prime.FileIO(model).import_cad(str(args.cad.resolve()),
-                    prime.ImportCadParams(model, geometry_transfer=True,
-                        part_creation_type=prime.PartCreationType.BODY)), 'import CAD')
+                invalidate_queries()
+                import_geometry(model, args.cad)
                 original, members = inspect_names(model, output, cfg)
                 report['automatic_recognition'] = AUTO_RECOGNITION
                 report['automatic_boundary_mapping'] = AUTO_MAPPING
-                geometry = measure(model)
+                geometry = measure(model, coarse=args.coarse)
                 report['geometry'] = geometry
                 report['original_names'] = original
                 if args.dry_run:
@@ -960,15 +1220,17 @@ def run(argv=None):
                     return 0
                 # IDs may differ on reimport: use exact part names to carry failure scope.
                 failed_ids = {p.id for p in model.parts if p.name in failed_parts}
-                sizes = sizing(geometry, cfg, iteration, failed_ids)
+                sizes = coarse_sizing(geometry, cfg, iteration) if args.coarse else sizing(geometry, cfg, iteration, failed_ids)
                 attempt['requested_sizing'] = sizes
-                prepare_boundaries(model)
+                save_report(report, report_path, output)
+                prepare_boundaries(model, coarse=args.coarse)
                 write_mapping(output)
                 try:
-                    attempt['fill_types'] = mesh(model, sizes, cfg, members, force_tet)
+                    attempt['fill_types'] = (mesh_coarse(model, sizes, cfg, members) if args.coarse
+                                             else mesh(model, sizes, cfg, members, force_tet))
                 except RuntimeError as exc:
                     attempt['meshing_error'] = str(exc)
-                    if not force_tet and iteration < args.max_iterations:
+                    if not args.coarse and not force_tet and iteration < args.max_iterations:
                         LOG.exception('Mesh attempt failed; reimport original CAD and retry TET')
                         force_tet = True
                         failed_parts = {p.name for p in model.parts}
@@ -983,8 +1245,8 @@ def run(argv=None):
                     attempt['quality'].extend(rows)
                 attempt['summaries'] = {p.name: p.get_summary(prime.PartSummaryParams(model))._jsonify()
                                         for p in model.parts}
-                attempt['named_surface_quality'] = surface_diagnostics(model)
-                report['final_names'] = verify_auto_boundaries(model)
+                attempt['named_surface_quality'] = [] if args.coarse else surface_diagnostics(model)
+                report['final_names'] = verify_auto_boundaries(model, coarse=args.coarse)
                 if not failed:
                     report['mesh'] = str(export_fluent_mesh(model, output, cfg))
                     report['boundary_type_application'] = (
@@ -1006,6 +1268,9 @@ def run(argv=None):
         LOG.exception('Meshing workflow failed')
         return 2
     finally:
+        report['last_runtime_state'] = MONITOR.snapshot()
+        MONITOR.stop()
+        MONITOR = None
         save_report(report, report_path, output)
 
 

@@ -21,5 +21,7 @@
   "min_element_quality": 0.01,
   "preferred_fill": "POLY",
   "fluent_executable": null,
-  "fluent_timeout_seconds": 1800
+  "fluent_timeout_seconds": 1800,
+  "coarse_diagonal_ratio": 0.03333333333333333,
+  "recognition_budget_seconds": 120
 }

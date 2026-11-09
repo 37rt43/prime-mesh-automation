@@ -10,7 +10,7 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 python pump_mesh_auto.py --cad ./FFF-8.scdoc --output ./recognition_check --dry-run
-python pump_mesh_auto.py --cad ./FFF-8.scdoc --output ./mesh_run --config ./mesh_config.json --target-orthogonal-quality 0.1 --max-iterations 4
+python pump_mesh_auto.py --coarse --cad ./FFF-8.scdoc --output ./coarse_run --config ./mesh_config.json --target-orthogonal-quality 0.1 --max-iterations 4
 ```
 
 cmd.exe 激活使用 `.\.venv\Scripts\activate.bat`。
@@ -19,9 +19,47 @@ cmd.exe 激活使用 `.\.venv\Scripts\activate.bat`。
 `--help` 不启动 Prime。`main.py` 统一提供安全启动入口；不使用 insecure 连接或 Docker。
 CAD 文件需要用户提供，仓库不含 `FFF-8.scdoc`。
 
-支持参数：`--cad`、`--output`、`--target-orthogonal-quality`、`--max-iterations`、
+支持参数：`--coarse`、`--prime-timeout`、`--cad`、`--output`、`--target-orthogonal-quality`、`--max-iterations`、
 `--mesh-format Fluent`、`--dry-run`、`--report`、`--config`。
 `--report` 指定 JSON 路径，CSV/日志仍位于 `--output`。
+
+## 第一阶段：先运行粗网格验证
+
+正式运行建议先使用 `--coarse`。粗网格完成后先在 Fluent 检查区域、端口和接口，再决定后续局部加密。
+不会在粗网格成功后自动进入精细模式。
+
+```powershell
+python pump_mesh_auto.py --coarse --cad ./FFF-8.scdoc --output ./coarse_run --prime-timeout 900
+```
+
+粗网格路径只有**一份全局 GlobalSizingParams**，尺寸由整体 bounding box 对角线 × coarse_diagonal_ratio 推导。
+为完全绕过已卡住的接口，`create_size_control`、`set_soft_sizing_params` 调用次数都为 **零**。
+直接调用 Surfer 的 CONSTANT 面网格和 AutoMesh 的 CONSTANT/TET 体网格，不走可能隐式创建曲率控制的 Lucid 入口。
+不创建局部、曲率或 proximity 尺寸控制，不计算体尺寸场，不生成膨胀层；体区域仍设为 FLUID。
+不逐个 wall 建尺寸控制，也不统计每个 wall 的表面质量；保留必要的全域体质量检查与修复。
+质量修复重划时整体相对尺寸逐次缩小，仍保持单一全局尺寸。
+
+原始 zone/label/face 查询按导入代缓存；自动范围的空查询直接返回空集，不再对每个缺失范围向服务器询问 label/zone。
+修改模型后显式使缓存失效。粗网格跳过逐边特征和逐边界 bounding box 测量，边界赋值只执行必要的 zone 操作，
+不创建局部 sizing 标签或 prism 标签。自动识别和 auto_boundary_mapping.csv 保留。
+
+识别 CPU 阶段默认预算 `recognition_budget_seconds=120`；超过预算时记录原因，全部面回退 uncertain wall，继续网格。
+这个预算约束客户端几何分类，不会强行取消仍在执行的 Prime 几何查询。
+粗网格用于验证整条网格流程，不等于最终 CFD 生产网格。以下“自动网格与质量”章节中的局部控制和膨胀层仅适用于不带 `--coarse` 的原有精细路径。
+
+## 阶段日志、心跳与超时诊断
+
+主要阶段输出带时间戳的 `STAGE BEGIN/END` 和耗时；粗网格的每个部件分别输出 surface_mesh、volume_mesh 阶段。
+从 Prime 启动阶段起，后台每 **30 秒**记录 `HEARTBEAT`：当前阶段、阶段耗时、正在等待的 Prime 命令与该调用耗时。
+心跳线程只读本地状态，**不发送任何并发 Prime RPC**。
+
+`--prime-timeout` 默认 900 秒，是**超时诊断阈值，不是强制取消期限**。
+0.5.1 的 RPC 没有这里可安全使用的取消参数；超过阈值时记录 TIMEOUT DIAGNOSTIC、保存所有 Python 线程堆栈，继续心跳。
+不会杀死服务器、从另一个线程重划网格，或把仍在执行的调用误当成已取消。
+如果调用一直不返回，需结合 Prime Server 的 CPU 和日志判断继续等待还是人工终止。
+
+额外诊断文件：`prime_runtime_status.json`（心跳时更新）和 `prime_timeout_stacks.txt`（发生超时诊断时生成）。
+`mesh_quality_report.json` 在开始准备边界前先落盘，最终完成/失败再更新。所有网格和质量指标仍需本机验证。
 
 ## 区域识别：不再要求原始命名
 

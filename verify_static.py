@@ -38,6 +38,7 @@ methods = {
  'VolumeControl': ['set_scope','set_params'],
  'FileIO': ['import_cad','export_fluent_meshing_mesh'],
  'SurfaceUtilities': ['get_bounding_box_of_zonelets'],
+ 'Surfer': ['mesh_topo_faces'],
  'MeshInfo': ['get_face_and_edge_connectivity'],
  'SizeField': ['compute_volumetric'], 'AutoMesh': ['mesh'],
  'VolumeSearch': ['get_volume_quality_summary'],
@@ -56,6 +57,7 @@ def forbidden():
 m.launch_prime = forbidden
 assert m.arguments([]).cad.name == 'FFF-8.scdoc'
 assert m.arguments(['--dry-run']).dry_run
+assert m.arguments(['--coarse']).coarse
 cfg = m.configuration(None)
 def geom(scale):
     return {'overall': {'extents':[10*scale,20*scale,30*scale]},

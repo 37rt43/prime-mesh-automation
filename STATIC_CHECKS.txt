@@ -1,12 +1,15 @@
 Python syntax parsed with Python 3.11 grammar: PASS
 Import main workflow without launching Prime: PASS
-PyPrimeMesh 0.5.1: 32 constructor/call keyword checks: PASS
-44 Prime method existence/signature checks: PASS
+PyPrimeMesh 0.5.1: 41 constructor/call keyword checks: PASS
+45 Prime method existence/signature checks: PASS
 CLI defaults, scale invariance (1:1000), repair sizing reduction: PASS
 Prime server starts / CAD imports / meshing calls executed: ZERO
 Host check interpreter: 3.11.17 (offline Linux checks; Windows/Prime runtime not exercised)
 All checks passed!
 Python 3.11.17, pinned requirements.txt dependencies installed: PASS
-python -m py_compile pump_mesh_auto.py main.py verify_static.py tests/test_auto_boundaries.py: PASS
-python -m unittest discover -s tests -v: 27 tests PASS (14 automatic-boundary tests)
-All recognition checks used analytic geometry/mocks only; actual CAD recognition, meshing, quality and prism thickness: pending local validation.
+py_compile main workflow, verifier and coarse tests: PASS
+python -m unittest discover -s tests -v: 34 tests PASS
+Coarse path: one global sizing parameter set, zero SizeControl objects, zero curvature/proximity fields, zero prism controls: PASS (mocks)
+Cached empty auto scopes, metadata invalidation, heartbeat timeout diagnostics, communicator restoration, recognition-budget wall fallback: PASS
+Timeout threshold provides diagnostics only; an in-flight Prime RPC is not forcibly cancelled.
+All checks offline; real CAD recognition, mesh output and quality remain pending local validation.
