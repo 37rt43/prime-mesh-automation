@@ -1,0 +1,9 @@
+Python syntax parsed with Python 3.11 grammar: PASS
+Import main workflow without launching Prime: PASS
+PyPrimeMesh 0.5.1: 29 constructor/call keyword checks: PASS
+39 Prime method existence/signature checks: PASS
+CLI defaults, scale invariance (1:1000), repair sizing reduction: PASS
+Prime server starts / CAD imports / meshing calls executed: ZERO
+Host check interpreter: 3.12.14 (not local 3.11 runtime validation)
+Wheel SHA256: b8b84ecffe15ae94517ddd06d93b6d5494d745d46daf57c0b7bf37d686b2b174
+All checks passed!

@@ -1,0 +1,21 @@
+{
+  "global_diagonal_ratio": 0.016666666666666666,
+  "minimum_global_ratio": 0.03333333333333333,
+  "local_span_ratio": 0.041666666666666664,
+  "wall_global_ratio": 0.45,
+  "port_global_ratio": 0.65,
+  "curvature_normal_angle_degrees": 12.0,
+  "elements_per_gap": 6,
+  "growth_rate": 1.15,
+  "refinement_factor": 0.75,
+  "prism_first_to_local_ratio": 0.025,
+  "prism_total_to_local_ratio": 0.5,
+  "prism_max_layers": 12,
+  "prism_growth_rate": 1.15,
+  "max_skewness": 0.9,
+  "max_aspect_ratio": 100.0,
+  "min_element_quality": 0.01,
+  "preferred_fill": "POLY",
+  "fluent_executable": null,
+  "fluent_timeout_seconds": 1800
+}
