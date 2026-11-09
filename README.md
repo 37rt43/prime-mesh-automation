@@ -1,132 +1,122 @@
-# FFF-8 本机网格自动化交付说明
+# FFF-8 泵流体网格自动化（Prime 2024 R1）
 
-适用：Windows、Python **3.11**、Ansys **2024 R1 / Prime Server 24.1**、PyPrimeMesh **0.5.1**。
-云端没有启动 Prime，没有导入 CAD，没有划分网格，没有生成任何网格质量实测报告。
-当前仓库没有 FFF-8.scdoc，需将交付目录与本机 CAD 放在一起运行。
+环境：Windows、Python **3.11**、Ansys Prime Server **24.1**、PyPrimeMesh **0.5.1**。
+云端只执行离线检查，不启动 Prime，不导入 CAD，不生成计算网格。
 
-## 先说明范围
-
-这是经过静态检查的本机执行脚本，**不能宣称已完整实现或验证用户清单中所有高级诊断**。
-以下能力在此交付中尚未实现，不能以部件统计代替它们：
-
-- 精确坏体单元 ID、坐标，以及隔舌、叶片前后缘、密封间隙和 interface 邻域的独立体单元质量统计。
-  0.5.1 的 `VolumeSearch.get_volume_quality_summary` 只提供部件级极值和失败数量。
-- 密封真实最小间隙和 CAD 曲率半径的显式数值提取。脚本记录几何边包围盒跨度代理值，
-  **不会把它当成真实间隙**；实际曲率和 proximity 尺寸由 Prime 尺寸场计算。
-- 隔舌和叶片前后缘的独立几何语义识别。当前保守加密整个命名壁面，并叠加曲率和 proximity 控制。
-- 实际膨胀层逐层厚度、壁面覆盖率、塌缩/折叠的专门检测。报告区分 requested 参数与 actual=null。
-- Fluent 读回后逐项核对命名、边界类型以及 Fluent 质量定义的独立验收。导出前只检查 Prime 中的命名。
-
-故成功状态明确是 `part_quality_passed_with_documented_diagnostic_limitations`，不是全清单验收通过。
-如项目必须逐项通过全部原始验收要求，需要补充本机 Fluent 诊断模块和真实模型验证。
-
-## 文件
-
-- pump_mesh_auto.py：完整主工作流；所有长度由导入几何推导，没有绝对毫米尺寸或目标网格数量。
-- main.py：集中、安全的本机 `launch_prime` 入口，导入模块不会启动服务器。
-- mesh_config.json：仅相对比例、阈值、无量纲参数；可选 Fluent 可执行文件路径。
-- requirements.txt：固定客户端与 Python 依赖；Ansys 软件及许可证不通过 pip 安装。
-- STATIC_CHECKS.txt：本次静态检查记录，不是网格质量报告。
-- verify_static.py：可复核 API 名称/参数的静态检查脚本，不调用 Prime 服务。
-
-## 本机运行（PowerShell）
-
-将压缩包解压到独立目录，保留 main.py 与 pump_mesh_auto.py 同级。
+## 运行
 
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python pump_mesh_auto.py --cad ./FFF-8.scdoc --output ./output_check --dry-run
-python pump_mesh_auto.py --cad ./FFF-8.scdoc --output ./output_mesh --config ./mesh_config.json --target-orthogonal-quality 0.1 --max-iterations 4 --mesh-format Fluent --report ./output_mesh/mesh_quality_report.json
+python pump_mesh_auto.py --cad ./FFF-8.scdoc --output ./recognition_check --dry-run
+python pump_mesh_auto.py --cad ./FFF-8.scdoc --output ./mesh_run --config ./mesh_config.json --target-orthogonal-quality 0.1 --max-iterations 4
 ```
 
-cmd.exe 激活命令：`.\.venv\Scripts\activate.bat`。
-`--dry-run` 会在**本机启动 Prime 并导入 CAD**，仅检查几何与命名，不划分面/体网格，不输出最终网格。
-`--help` 不导入 Prime 模块，也不启动服务器。
+cmd.exe 激活使用 `.\.venv\Scripts\activate.bat`。
+每次使用新的输出目录，避免把旧网格当成本次结果。
+`--dry-run` 会在**本机**启动 Prime，导入几何并执行自动识别，写映射报告，但不划分面/体网格。
+`--help` 不启动 Prime。`main.py` 统一提供安全启动入口；不使用 insecure 连接或 Docker。
+CAD 文件需要用户提供，仓库不含 `FFF-8.scdoc`。
 
-本机安装应能由 Prime 客户端自动定位 2024 R1 安装。
-若系统安装多个 Ansys 版本，先确保本次环境只定位 24.1 后端；脚本不设置 insecure 连接。
-无需在配置中写许可证服务器。
+支持参数：`--cad`、`--output`、`--target-orthogonal-quality`、`--max-iterations`、
+`--mesh-format Fluent`、`--dry-run`、`--report`、`--config`。
+`--report` 指定 JSON 路径，CSV/日志仍位于 `--output`。
 
-## HDF5 网格输出需要本机 Fluent
+## 区域识别：不再要求原始命名
 
-0.5.1 原生文档路径支持 Fluent Meshing `.msh` 以及 Fluent `.cas.h5`，
-没有可核实的 `.msh.h5` 导出参数。因此脚本先导出 `pump_intermediate.msh`，
-然后使用**本机 Fluent 2024 R1**批处理转换为真正的 `pump.msh.h5`。
-这额外需要本机 Fluent 可运行及相应许可证，不能只安装 PyPrimeMesh。
-自动查找顺序：配置 `fluent_executable` → PATH 中的 fluent → `%AWP_ROOT241%` 下的 Fluent。
-若自动查找失败，编辑配置，例如：
+CAD 使用 `PartCreationType.BODY` 导入，尽量令一个 CAD body 对应一个 part。
+不再要求 Inlet、inlet_body、原始 wall/interface 等命名选择存在；`label0:xxx`、空 face_zones 均可处理。
+原始 label 和 topo face ID 只用来追溯，不作为必须满足的检查条件。
 
-```json
-{"fluent_executable": "C:/Program Files/ANSYS Inc/v241/fluent/ntbin/win64/fluent.exe"}
+- volume zone 或 part 明确命名为 `solid` 的 body 从工作模型删除，不参与网格、尺寸场、质量统计和导出。
+- `impeller`/`rotor`、`volute`、`stator`/`stationary`、`seal` 等可选名称提示参与区域判断。
+  因此 ns_impeller_1_flowdomainvirtual、ns_volute_1_flowdomainvirtual、ns_stator_1_flowdomain 可分别识别。
+- 名称发生变化时，使用 body 主方向跨度、扁平/近圆特征和接触图判断旋转区、邻接蜗壳候选、静止区和密封区。
+  几何推断的区域标记 `uncertain`。没有固定要求“四个区域必须全部存在”。
+- 没有材料证据的未知 body 暂保留为不确定流体候选。**仅凭几何无法唯一证明材料是流体还是固体**，
+  请在本机检查区域报告；不能声称能可靠识别任意改名后的实体材料。
+
+## 面边界识别顺序
+
+1. **先 interface**：读取 CAD 显示面片的顶点/连接关系，检测跨 body 的候选接触。
+   包围盒仅用于初筛，随后计算点到三角片的距离和面覆盖率，避免仅凭包围盒相交就认定接触。
+   使用面积加权的确定性采样，同时探测面片顶点；不同 CAD 面分割可通过对侧候选面的并集检测。
+   两侧分别命名 `auto_interface_1`、`auto_interface_2` 等，`interface_pair` 列关联对应面。
+   **不缝合、不合并接口两侧**，也不自动建立 Fluent 的 mesh-interface 配对。
+2. **再端口**：从未分配面中筛选近似平面、圆形/环形、位于 body 法向极端位置、相邻壁面沿轴向延伸的候选面。
+   使用旋转区轴向和静止区偏好选 `auto_inlet`，使用蜗壳偏好选 `auto_outlet`。
+   几何无法唯一确定流向，因此端口也标记 `uncertain`；无可靠候选时不强造端口，不中断。
+3. **最后所有剩余面归 wall**：`auto_impeller_wall`、`auto_volute_wall`、`auto_stationary_wall`、`auto_seal_wall`。
+   未知、缺少显示面片、不能确认接触、其他额外端面均默认 wall，并写明 `uncertain` 和识别依据。
+   不存在“名称不匹配即退出”或“未分类面不分配”的路径。
+
+面积、法向、中心和形状指标来自 **CAD 显示用离散面片**，不等于生成了计算网格，也不是精确 CAD 积分面积。
+面积单位为 CAD 导入长度单位的平方；无法获取面片时面积留空，不能编造。
+显示面片不足、曲面两侧离散误差、仅部分重合且需要拓扑切分、分割端盖，均可能降低识别准确性。
+不能完整确认的面按要求回退 uncertain wall；这类结果必须在 Fluent 中检查，不能直接视为可求解模型。
+
+识别参数集中在 `mesh_config.json`：
+
+- recognition_contact_ratio：接触容差/整体 bounding box 对角线。
+- recognition_contact_coverage：判定整个面为接触面的最低采样覆盖率。
+- recognition_planarity_ratio：平面偏差与端部位置判断的相对容差。
+- recognition_samples：每面最多使用的面积分层采样数（还会检查对应三角片顶点）。
+
+没有写死任何绝对网格长度或目标网格数量。调整识别容差时注意真实密封间隙，过大容差可能把近邻壁面误判为接触。
+
+## 自动网格与质量
+
+所有自动分区参与非结构化网格。整体尺寸由 bounding box 对角线比例推导，局部尺寸使用几何边跨度代理值。
+自动 wall、端口和 interface 均有局部尺寸控制，并叠加 CAD curvature/proximity sizing 和平滑增长率。
+叶片、隔舌、弯道、密封等特征通过所在壁面整体加密和曲率/近邻控制覆盖，**不宣称已独立语义定位每个前后缘或隔舌**。
+
+棱柱层只作用于自动 wall 子集；旧标签即使含有同名 `__pump_wall` 也先清空再按自动分类重建，避免端口/interface 混入。
+首层高度、层数、增长率由局部尺度和预算推导；启用 `PrismStairStep` proximity 碰撞处理。
+实际壁面身份存在不确定性时，按用户指定的 wall 回退原则处理，不能保证该面物理上一定是壁面。
+无流动参数时不声称达到目标 y+。请求层参数和实际厚度分别记录，实际厚度未测量时为 null。
+
+蜗壳默认 POLY，可选 HEXCOREPOLY；客户端检查枚举能力。不支持或网格操作失败时，在新的模型/迭代中回退 TET。
+各部件检查 INVERSEORTHOGONAL、SKEWNESS、ASPECTRATIO、ELEMENTQUALITY。
+`最小正交质量 = 1 - 最大 INVERSEORTHOGONAL`，要求严格大于目标，目标不得低于 0.1。
+先尝试节点移动修复，再重新导入原 CAD、重新识别、缩小失败部件尺寸及请求首层高度、重建表面和体网格。
+`--max-iterations` 为初始尝试外的最多重划次数，默认 4。
+
+**识别不确定性不会中断网格流程；CAD 无有效体、服务器操作失败、质量耗尽仍不合格等真实错误仍会报错。**
+不会为了保证“输出成功”而绕过质量阈值。
+0.5.1 的质量 API 提供部件级统计，没有精确坏体单元坐标，也没有关键特征邻域的独立体质量统计。
+命名面的表面质量另行记录，不冒充邻近体单元质量。
+
+## 输出
+
+- `auto_boundary_mapping.csv`：每个流体 topo face 一行，包括原始 label/ID、新 zone 名、预期类型、区域、
+  face_count、面积/面积状态、中心、法向、平面性、法向一致性、uncertain、识别依据和 interface_pair。
+- `meshing_log.txt`：完整操作、假设、尺寸、警告与失败原因。
+- `mesh_quality_report.json`：原始名字快照、自动区域/排除实体、识别映射、每次网格参数与质量统计。
+- `mesh_quality_summary.csv`：部件级质量摘要。
+- `pump.msh`：质量达标后导出的原生 Fluent 可读网格。
+- 可选 `pump.msh.h5`：本机 Fluent 可用时，执行 journal 转换并验证真实 HDF5 格式及 meshes 组。
+
+Fluent 查找顺序：配置 fluent_executable → PATH 中 fluent → `%AWP_ROOT241%` 下 Fluent 2024 R1。
+HDF5 转换还需要本机 Fluent 许可证。转换不可用/失败时保留有效原生 `pump.msh`，记录警告并交付该文件。
+不会简单改后缀伪装 HDF5。
+
+映射中的 zone_type 是**识别出的预期物理类型**。Prime 的 FACE zone 不是 Fluent 求解器完整边界条件配置。
+原生 `.msh` 请按 CSV 在 Fluent 检查/设置类型；可选转换 journal 会请求 velocity-inlet、pressure-outlet、
+interface、wall 类型，但仍需本机验证，接口配对和物理工况由用户配置。
+
+## 离线验证
+
+```powershell
+python -m py_compile pump_mesh_auto.py main.py verify_static.py
+python verify_static.py
+python -m unittest discover -s tests -v
 ```
 
-脚本生成转换 journal、保留转换日志，检查子进程退出码、真实 HDF5 格式和 `meshes` 组。
-不会将 `.msh` 改后缀伪装为 HDF5。TUI journal 必须在用户本机 2024 R1 验证；若命令提示或转换失败，
-脚本返回失败并保留原始 `.msh`，不会宣称 `.msh.h5` 成功。
-
-## 命名与分区
-
-四组区域名称使用精确匹配，区域显示名/别名接受 Inlet、Impeller、Volute-Reargap-Outlet、Seal_Chamber；
-清单中明确列出的四个 body 名仍必须存在。所有列出的边界名必须具有非空 CAD 面范围。
-缺失或空范围均抛出异常，并在日志列出实际 part/label/zone 名；不做模糊匹配、不静默重命名。
-原始名称在每次导入后记录，在导出前复核；CAD 标签需要导出为 zone 时使用原名创建。
-额外原始标签保留；没有显式壁面/端口/interface 分类的面将报错，不能猜测它属于 wall。
-要求每个导入 part 恰属于一个流体区域，且四区域都可解析；额外固体或混合区域会明确拒绝。
-若实际 CAD 的组织方式不满足这些条件，需要针对其真实拓扑扩展区域解析，不能直接误划为流体。
-
-真实壁面白名单：impeller_blade_wall、impeller_front_cover、impeller_rear_cover、sealchamber-end、
-seal_chamber_wall、inlet_wall、volute_wall。
-sealchamber_inlet、inlet、outlet 和四个 interface 均排除膨胀层。
-若某个面的壁面/端口/interface 分类重叠将报错。默认不连接、不合并两个 interface 面。
-zone 名称不等同于 Fluent 已设置的物理边界条件，使用前须在 Fluent 中检查。
-
-## 自动尺寸与边界层
-
-整体基准尺寸 = 整体 bounding box 对角线 × global_diagonal_ratio。
-局部特征代理值 = 各部件几何边包围盒对角线分布的低分位跨度；局部尺寸受该跨度和整体尺寸相对比例共同限制。
-平滑增长率根据最大/最小尺寸比和过渡步数推导，并受配置上限限制。
-所有壁面、端口和 interface 有命名范围尺寸控制；CAD curvature 和 proximity 叠加生成体尺寸场。
-比例、模型尺度、各部件尺寸、代理值、计算出的尺寸和请求层参数全部记录到日志及 JSON。
-包围盒跨度不是几何体积、真实壁面间距或水力直径。
-
-膨胀层首层高度依据局部尺寸比例，层数由允许总厚度预算与几何级数反算，增长率由局部尺度比推导。
-未使用流量、转速、介质参数，不宣称达到某个 y+。
-显式开启 `PrismStairStep(check_proximity=True, gap_factor_scale=0.5)`，让后端处理局部近邻碰撞；
-此行为不能替代对窄间隙实际层数/厚度的本机验收。请求参数可能被后端局部截断。
-若要求层的部件完全没有棱柱单元，脚本立即失败。
-
-## 质量与修复
-
-各 part 的 INVERSEORTHOGONAL、SKEWNESS、ASPECTRATIO、ELEMENTQUALITY 均必须返回有限统计。
-脚本使用 `正交质量 = 1 - 最大 INVERSEORTHOGONAL`，且要求严格大于指定目标（目标不得低于 0.1）。
-这不是未经比对的 Fluent 验收保证。其余指标使用配置阈值；边界层高 aspect ratio 可能需要物理上合理的项目阈值。
-
-失败先请求内部节点移动修复并重新统计；仍失败时重新启动 Prime、导入原始 CAD、缩小失败部件尺寸和请求首层高度，
-重建表面和体尺寸场、重新划分整个模型。不会复用被部分失败操作修改的模型。
-蜗壳优先 POLY，可配置 HEXCOREPOLY；检查枚举能力。非 TET 模式网格操作失败时明确记录原因，
-在下一次允许的迭代使用新模型回退 TET。失败原因不会被描述成已证实的 API 不支持。
-超过迭代次数仍不达标返回 2，不导出最终网格。
-`--max-iterations` 是初始尝试之外的最多重划次数，默认 4，即最多 5 次。
-另对各命名边界统计**表面面片质量**，明确标识不是邻近体单元统计。
-
-## 输出与失败行为
-
-成功导出：pump.msh.h5、mesh_quality_report.json、mesh_quality_summary.csv、meshing_log.txt、
-zone_and_boundary_check.csv，并保留原生网格及转换 journal/log。
-可用 `--report` 改 JSON 路径，CSV 和日志仍放在 `--output`。
-缺 CAD/命名失败/后端失败/质量不合格/转换失败均返回 2，并尽可能保留日志、JSON、CSV；
-CAD 尚未导入时自然无法生成真实 zone 清单，JSON 不会伪造该清单。
-输出目录已有 pump.msh.h5 时拒绝覆盖，避免旧成功网格被误认为本次结果。
-重新执行请选新目录。dry-run 返回成功只表示几何与命名检查通过。
-
-## API 对照来源
-
-实际核对 PyPI 官方发布的 ansys-meshing-prime==0.5.1 wheel 的 autogen/core/lucid 源码及签名：
+测试使用解析几何和模拟模型，**不启动 Prime、不读取真实 CAD、不划分网格**。
+覆盖接触优先级、分割接触、非接触重叠包围盒、真实间隙、部分接触回退、圆环面积、端部识别、
+旋转/单位缩放、区域改名、solid 排除、通用 label 追溯、缺少面片仍全分配，以及旧 wall 标签不污染端口/interface。
+静态核对使用官方 PyPI ansys-meshing-prime==0.5.1 源码及签名：
 https://pypi.org/project/ansys-meshing-prime/0.5.1/
-源码项目：https://github.com/ansys/pyprimemesh
-重点包括 automeshstructs.py、volumesearchstructs.py、volumemeshtool.py、prismcontrolstructs.py、
-fileiostructs.py、lucid/mesh_util.py。没有照抄最新版本 API。
 
-**网格数量、最小正交质量、skewness、实际边界层厚度均为“待本机验证”。**
+**网格数量、最小正交质量、skewness、实际膨胀层厚度及真实 CAD 识别效果，均待本机验证。**

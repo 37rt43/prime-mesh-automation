@@ -1,4 +1,8 @@
 {
+  "recognition_contact_ratio": 1e-05,
+  "recognition_contact_coverage": 0.98,
+  "recognition_planarity_ratio": 0.0001,
+  "recognition_samples": 128,
   "global_diagonal_ratio": 0.016666666666666666,
   "minimum_global_ratio": 0.03333333333333333,
   "local_span_ratio": 0.041666666666666664,

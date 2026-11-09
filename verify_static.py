@@ -25,18 +25,20 @@ for n in ast.walk(tree):
         count += 1
 # Verify every method used with a Prime object against its real class signature.
 methods = {
- 'Model': ['create_zone', 'get_zone_name', 'set_global_sizing_params', 'delete_volumetric_size_fields'],
+ 'Model': ['delete_parts', 'create_zone', 'get_zone_name', 'set_global_sizing_params', 'delete_volumetric_size_fields'],
  'Part': ['get_labels','get_topo_faces','get_topo_edges','get_topo_volumes','get_face_zones',
           'get_volume_zones','get_topo_faces_of_label_name_pattern','get_topo_faces_of_zone_name_pattern',
+          'remove_zone_on_topo_entities','remove_labels_from_topo_entities',
           'add_topo_entities_to_zone','add_labels_on_topo_entities','compute_topo_volumes',
           'get_summary','get_cell_zonelets'],
- 'TopoData': ['get_geom_zonelets_of_topo_faces','get_geom_zonelets_of_topo_edges'],
+ 'TopoData': ['get_adjacent_topo_faces_of_topo_faces', 'get_geom_zonelets_of_topo_faces','get_geom_zonelets_of_topo_edges'],
  'ControlData': ['create_size_control','create_prism_control','create_volume_control'],
  'SizeControl': ['set_scope','set_curvature_sizing_params','set_proximity_sizing_params','set_soft_sizing_params'],
  'PrismControl': ['set_surface_scope','set_volume_scope','set_growth_params'],
  'VolumeControl': ['set_scope','set_params'],
  'FileIO': ['import_cad','export_fluent_meshing_mesh'],
  'SurfaceUtilities': ['get_bounding_box_of_zonelets'],
+ 'MeshInfo': ['get_face_and_edge_connectivity'],
  'SizeField': ['compute_volumetric'], 'AutoMesh': ['mesh'],
  'VolumeSearch': ['get_volume_quality_summary'],
  'SurfaceSearch': ['get_surface_quality_summary'],
@@ -47,6 +49,7 @@ for cls, names in methods.items():
         assert callable(getattr(getattr(prime, cls), name)), (cls,name)
         inspect.signature(getattr(getattr(prime, cls),name))
 assert callable(prime.lucid.Mesh.surface_mesh_with_size_controls)
+assert prime.PartCreationType.BODY.name == 'BODY'
 # Import and CLI parser checks, with a launch trap to prove these checks are offline.
 def forbidden():
     raise AssertionError('No launch permitted in static verification')
@@ -72,4 +75,4 @@ print(f'PyPrimeMesh {prime.__version__}: {count} constructor/call keyword checks
 print(f'{sum(map(len,methods.values()))} Prime method existence/signature checks: PASS')
 print('CLI defaults, scale invariance (1:1000), repair sizing reduction: PASS')
 print('Prime server starts / CAD imports / meshing calls executed: ZERO')
-print('Host check interpreter: '+sys.version.split()[0]+' (not local 3.11 runtime validation)')
+print('Host check interpreter: '+sys.version.split()[0]+' (offline Linux checks; Windows/Prime runtime not exercised)')
